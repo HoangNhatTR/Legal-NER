@@ -94,16 +94,22 @@ def _applied_citations(grouped: dict) -> tuple[str, str]:
     return "; ".join(cites[:4]), law
 
 
+# "02 (hai)" — số rồi NGAY đến ngoặc chứa chữ. KHÔNG khớp "(đề nghị)" đứng xa số.
+_FORMAL_PENALTY_RE = re.compile(r"\d+\s*\([^)\d]+\)")
+
+
 def _pronounced_penalty(grouped: dict) -> str:
     """Mức hình phạt TÒA TUYÊN (không phải mức VKS đề nghị).
 
     Heuristic: phần QUYẾT ĐỊNH viết dạng formal có số bằng chữ trong ngoặc
-    ("02 (hai) năm tù") -> ưu tiên entity chứa '('; nếu không có thì lấy cái đầu.
+    ("02 (hai) năm tù") -> ưu tiên entity khớp pattern số+(chữ); nếu không có
+    thì lấy cái đầu. Lưu ý: chỉ '(' thôi chưa đủ — "03 năm tù (đề nghị)" của
+    VKS cũng có ngoặc nhưng không phải mức tuyên.
     Tránh truyền NHIỀU mức (VD '03 năm tù; 02 năm tù') khiến LLM cộng dồn sai.
     """
     pens = _uniq(grouped, "PENALTY", 5)
     for p in pens:
-        if "(" in p:
+        if _FORMAL_PENALTY_RE.search(p):
             return p
     return pens[0] if pens else "(không rõ mức hình phạt)"
 
@@ -118,21 +124,35 @@ def _cited_articles(grouped: dict) -> list[str]:
     return nums
 
 
-def _chat_body(content: str, model: str, llm_model: str, stream: bool) -> dict:
+def _chat_body(
+    content: str, model: str, llm_model: str, stream: bool, search_query: str = "",
+) -> dict:
     """Body cho /v1/chat/completions. ``llm_model`` = model LLM người dùng chọn ở
-    chế độ trò chuyện (vd cc/claude-sonnet-4-6); để trống -> Module 1 dùng mặc định."""
+    chế độ trò chuyện (vd cc/claude-sonnet-4-6); để trống -> Module 1 dùng mặc định.
+
+    skip_router=True: máy gọi máy — Module 1 đi thẳng Flow C RAG, TẤT ĐỊNH,
+    không bao giờ rơi nhầm sang validate_document/chitchat (guard+retry cũ chỉ
+    còn là lưới an toàn). ``search_query``: truy vấn RETRIEVE riêng, gọn và
+    đích danh (điểm/khoản/Điều) — prompt dài đầy hướng dẫn không dùng để tìm.
+    """
     body = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
         "stream": stream,
         "temperature": 0.2,
+        "skip_router": True,
     }
+    if search_query:
+        body["search_query"] = search_query
     if llm_model:
         body["llm_model"] = llm_model
     return body
 
 
-def _rag_chat(content: str, model: str, llm_model: str = "", timeout: int = 240) -> str:
+def _rag_chat(
+    content: str, model: str, llm_model: str = "", timeout: int = 240,
+    search_query: str = "",
+) -> str:
     """Một lượt hỏi Module 1 (stream=false). Trả về text trả lời."""
     try:
         r = requests.post(
@@ -141,7 +161,7 @@ def _rag_chat(content: str, model: str, llm_model: str = "", timeout: int = 240)
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {RAG_KEY}",
             },
-            json=_chat_body(content, model, llm_model, stream=False),
+            json=_chat_body(content, model, llm_model, stream=False, search_query=search_query),
             timeout=timeout,
         )
         r.raise_for_status()
@@ -191,16 +211,19 @@ def run_analyze(
     trong khung, tội danh khớp) kèm trích dẫn nguồn. Raises AnalyzeError khi RAG lỗi.
     """
     scenario, arts = _build_scenario(case_meta, grouped)
-    analysis = _rag_chat(scenario, model, llm_model)
+    applied, law = _applied_citations(grouped)
+    # Truy vấn retrieve đích danh (skip_router dùng cái này thay vì prompt dài)
+    sq = f"khung hình phạt {applied} {law}" if applied else ""
+    analysis = _rag_chat(scenario, model, llm_model, search_query=sq)
 
-    # Guard: nếu router lỡ trả chào mẫu / template validate, thử LẠI một lần với
-    # tiền tố ép rõ đây là câu hỏi tư vấn (không phải yêu cầu kiểm tra văn bản).
+    # Lưới an toàn (với skip_router gần như không bao giờ kích hoạt): nếu vẫn
+    # nhận chào mẫu / template validate, thử LẠI một lần với tiền tố ép tư vấn.
     if _looks_useless(analysis):
         retry = (
             "Đây là một CÂU HỎI TƯ VẤN PHÁP LUẬT về khung hình phạt, KHÔNG phải "
             "yêu cầu kiểm tra/thẩm định văn bản. Hãy trả lời trực tiếp:\n\n" + scenario
         )
-        analysis = _rag_chat(retry, model, llm_model)
+        analysis = _rag_chat(retry, model, llm_model, search_query=sq)
 
     return {
         "cited_articles": arts,
@@ -227,7 +250,10 @@ def _sse_passages(passages: list[dict]) -> str:
     return f"data: {json.dumps({'passages': passages}, ensure_ascii=False)}\n\n"
 
 
-def _stream_rag_lines(scenario: str, model: str, llm_model: str = "", timeout: int = 300):
+def _stream_rag_lines(
+    scenario: str, model: str, llm_model: str = "", timeout: int = 300,
+    search_query: str = "",
+):
     """Generator: gọi Module 1 (stream=True) và CHUYỂN TIẾP nguyên các dòng SSE
     'data: {...}' kiểu OpenAI. Lỗi -> đẩy 1 chunk báo lỗi + '[DONE]'."""
     try:
@@ -237,7 +263,7 @@ def _stream_rag_lines(scenario: str, model: str, llm_model: str = "", timeout: i
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {RAG_KEY}",
             },
-            json=_chat_body(scenario, model, llm_model, stream=True),
+            json=_chat_body(scenario, model, llm_model, stream=True, search_query=search_query),
             stream=True,
             timeout=timeout,
         ) as r:
@@ -250,10 +276,18 @@ def _stream_rag_lines(scenario: str, model: str, llm_model: str = "", timeout: i
         yield "data: [DONE]\n\n"
 
 
-def _stream_rag_messages(messages: list[dict], model: str, llm_model: str = "", timeout: int = 300):
+def _stream_rag_messages(
+    messages: list[dict], model: str, llm_model: str = "", timeout: int = 300,
+    search_query: str = "",
+):
     """Như _stream_rag_lines nhưng gửi MẢNG messages (có system + lịch sử) thay vì
     một câu. Chuyển tiếp nguyên các dòng SSE 'data: {...}' từ Module 1."""
-    body = {"model": model, "messages": messages, "stream": True, "temperature": 0.2}
+    body = {
+        "model": model, "messages": messages, "stream": True, "temperature": 0.2,
+        "skip_router": True,
+    }
+    if search_query:
+        body["search_query"] = search_query
     if llm_model:
         body["llm_model"] = llm_model
     try:
@@ -390,7 +424,12 @@ def stream_ask(
     messages.append({"role": "user", "content": question})
 
     yield _sse_status("Đang tra cứu kho luật và trả lời…")
-    yield from _stream_rag_messages(messages, model, llm_model)
+    # skip_router (trong _stream_rag_messages) + truy vấn retrieve = câu hỏi
+    # đã gộp ngữ cảnh lượt trước — tất định, không lo router nhầm validate
+    yield from _stream_rag_messages(
+        messages, model, llm_model,
+        search_query=_retrieval_query(question, history),
+    )
 
 
 def stream_analyze(
@@ -398,13 +437,14 @@ def stream_analyze(
 ):
     """STREAM phân tích ĐỐI CHIẾU PHÁP LÝ (citation ↔ tội danh ↔ khung hình phạt).
 
-    Phát 1 status heartbeat ngay đầu rồi chuyển tiếp SSE từ Module 1. (Bỏ guard
-    retry vì không thử lại được giữa luồng — scenario gọn đã route ổn định; có
-    /analyze đồng bộ làm fallback.)
+    skip_router → Module 1 đi thẳng RAG, tất định; retrieve theo truy vấn
+    đích danh (điểm/khoản/Điều) thay vì prompt dài đầy hướng dẫn.
     """
     scenario, _arts = _build_scenario(case_meta, grouped)
+    applied, law = _applied_citations(grouped)
+    sq = f"khung hình phạt {applied} {law}" if applied else ""
     yield _sse_status("Đang tra cứu kho luật và đối chiếu… (có thể ~1–2 phút)")
-    yield from _stream_rag_lines(scenario, model, llm_model)
+    yield from _stream_rag_lines(scenario, model, llm_model, search_query=sq)
 
 
 # ── Phân tích CHUYÊN SÂU bản chất hành vi (cấu thành / định tội / hợp lý / logic) ──
@@ -458,7 +498,10 @@ def _conduct_summary(facts: str, model: str, llm_model: str = "") -> str:
         "CHẤT gì và SỐ LƯỢNG, MỤC ĐÍCH, cách cất giấu/mang theo. Bắt đầu NGAY bằng "
         "nội dung, KHÔNG viết lời dẫn, KHÔNG trích dẫn luật:\n\n" + facts
     )
-    return _strip_preamble(_rag_chat(q, model, llm_model, timeout=120).strip())[:350]
+    # Lượt này chỉ cần LLM tóm tắt — search_query ngắn để retrieve nhẹ + cache ổn định
+    return _strip_preamble(
+        _rag_chat(q, model, llm_model, timeout=120, search_query=facts[:200]).strip()
+    )[:350]
 
 
 def _conduct_fallback(facts: str) -> str:
@@ -583,11 +626,10 @@ def stream_deep_analyze(
     """STREAM phân tích CHUYÊN SÂU bản chất hành vi (định tội / mức án / điểm bất hợp lý).
 
     Bước 1: tóm tắt diễn biến hành vi (LLM mode nhẹ; lỗi -> fallback heuristic).
-    Bước 2: hỏi RAG/LLM bằng NGÔN NGỮ TƯ VẤN. Router Module 1 là LLM (KHÔNG tất
-    định) -> đôi khi vẫn đẩy sang validate; nên ở đây GỌI NON-STREAM + GUARD: nếu
-    câu trả lời là template validate/chào thì THỬ LẠI 1 lần với tiền tố ép tư vấn,
-    rồi mới phát kết quả (đánh đổi token-streaming lấy độ tin cậy). Heartbeat giữa
-    các bước vẫn báo tiến trình.
+    Bước 2: hỏi RAG với skip_router → TẤT ĐỊNH, stream token THẬT từ Module 1.
+    (Trước đây router LLM bất định ~50% đẩy nhầm sang validate nên phải gọi
+    non-stream + retry 3 lần rồi giả stream theo cụm — skip_router trị tận gốc,
+    vòng retry đã bỏ.)
     """
     yield _sse_status("Đang đọc & tóm tắt diễn biến hành vi…")
     facts = _facts_section(text)
@@ -607,32 +649,9 @@ def stream_deep_analyze(
 
     yield _sse_status("Đang đối chiếu định tội, mức án với quy định pháp luật…")
     scenario = _build_deep_scenario(case_meta, grouped, conduct)
-    # Router Module 1 (LLM) KHÔNG tất định -> thử tối đa 3 lần với tiền tố ép tư
-    # vấn tăng dần; lấy câu trả lời hợp lệ đầu tiên.
-    prefixes = (
-        "",
-        "Đây là câu hỏi TƯ VẤN pháp luật để tìm hiểu, KHÔNG phải yêu cầu kiểm tra "
-        "văn bản. Hãy trả lời trực tiếp:\n\n",
-        "Bạn là chuyên gia tư vấn luật hình sự. Trả lời TRỰC TIẾP câu hỏi tư vấn "
-        "dưới đây, TUYỆT ĐỐI KHÔNG dùng mẫu “Báo cáo kiểm tra văn bản”:\n\n",
-    )
-    answer = ""
-    try:
-        for i, pre in enumerate(prefixes):
-            if i > 0:
-                yield _sse_status(f"Đang thử lại theo hướng tư vấn… (lần {i + 1}/3)")
-            answer = _rag_chat(pre + scenario, model, llm_model)
-            if not _looks_useless(answer):
-                break
-    except AnalyzeError as exc:
-        yield _sse(f"\n\n❌ Lỗi gọi RAG Module 1: {exc}")
-        yield "data: [DONE]\n\n"
-        return
-
-    if _looks_useless(answer):  # vẫn lỗi sau 3 lần -> báo rõ thay vì đổ template
-        answer = (
-            "⚠ Hệ thống RAG tạm thời định tuyến sai câu hỏi (trả về mẫu kiểm tra "
-            "văn bản). Vui lòng bấm **Phân tích lại** — thường lần sau sẽ thành công."
-        )
-    yield from _sse_chunks(answer)
-    yield "data: [DONE]\n\n"
+    # Truy vấn retrieve: tội danh + hành vi + điều luật — đích danh, không lẫn
+    # phần hướng dẫn trả lời trong scenario
+    crime = (_uniq(grouped, "CRIME", 1) or [""])[0]
+    applied, law = _applied_citations(grouped)
+    sq = " ".join(p for p in (crime, conduct[:160], applied, law) if p).strip()
+    yield from _stream_rag_lines(scenario, model, llm_model, search_query=sq)

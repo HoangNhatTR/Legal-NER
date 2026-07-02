@@ -42,6 +42,14 @@ class OcrError(Exception):
 
 
 def ocrspace_available() -> bool:
+    """True khi OCR đám mây được BẬT: có key VÀ không bị tắt tường minh.
+
+    ⚠ OCR.space nhận ẢNH TỪNG TRANG bản án — chỉ dùng cho văn bản đã công bố
+    công khai. Với tài liệu nhạy cảm: đặt LEGAL_NER_OCR_CLOUD=0 để ép offline
+    (EasyOCR) dù key vẫn còn trong env — không cần xóa key.
+    """
+    if os.environ.get("LEGAL_NER_OCR_CLOUD", "1").lower() in ("0", "false", "off"):
+        return False
     return bool(os.environ.get("LEGAL_NER_OCRSPACE_KEY"))
 
 

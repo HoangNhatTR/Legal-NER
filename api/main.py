@@ -359,6 +359,23 @@ async def analyze(req: AnalyzeRequest):
     return AnalyzeResponse(**result)
 
 
+@app.post("/corpus-check")
+async def corpus_check_endpoint(req: AnalyzeRequest):
+    """Kiểm chứng viện dẫn của bản án trên KHO LUẬT LỚN của Module 1 (~4,9M chunks).
+
+    Bổ sung cho khối citation trong /verify (vốn chỉ đối chiếu BLHS 2015 offline):
+    phủ MỌI ngành luật — dân sự, lao động, hành chính, nghị định... Nhận
+    entities_grouped từ /extract hoặc /verify (không cần upload lại PDF).
+    Best-effort: Module 1 không chạy → status="skipped", không lỗi.
+    """
+    from api.corpus_check import corpus_check
+
+    grouped = {
+        k: [e.model_dump() for e in v] for k, v in req.entities_grouped.items()
+    }
+    return corpus_check(grouped)
+
+
 @app.post("/analyze/stream")
 async def analyze_stream(req: AnalyzeRequest):
     """Như /analyze nhưng STREAM kết quả (SSE) để client hiện dần, không chờ 1-3 phút.
