@@ -14,7 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from api import jobs
 from api.odl_adapter import (
@@ -25,12 +25,22 @@ from api.odl_adapter import (
     shutdown_hybrid_server,
 )
 from api.schemas import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    AskRequest,
     ExtractResponse,
     HealthResponse,
     JobListItem,
     JobStatusResponse,
     JobSubmitResponse,
     OdlHealth,
+    PrecedentAddRequest,
+    PrecedentAddResponse,
+    PrecedentMatchRequest,
+    PrecedentMatchResponse,
+    PrecedentSearchRequest,
+    PrecedentStatsResponse,
+    VerifyResponse,
 )
 from api.service import (
     DEFAULT_EXTRACTOR,
@@ -40,6 +50,7 @@ from api.service import (
     ScannedPdfError,
     looks_like_pdf,
     run_extract,
+    run_verify,
 )
 
 _EXTRACTOR_DESC = (
@@ -102,6 +113,18 @@ def _job_runner(job: dict, data: bytes) -> dict:
             extractor=params.get("extractor", DEFAULT_EXTRACTOR),
         )
         return ExtractResponse(**result).model_dump()
+
+    if kind == "verify":
+        result = run_verify(
+            filename,
+            data,
+            holder,
+            allow_ocr=params.get("allow_ocr", True),
+            extractor=params.get("extractor", DEFAULT_EXTRACTOR),
+            check_existence_online=params.get("check_existence", True),
+            check_citations_offline=params.get("check_citations", True),
+        )
+        return VerifyResponse(**result).model_dump()
 
     raise ValueError(f"unknown job kind {kind!r}")
 
@@ -232,6 +255,250 @@ async def extract(
     return ExtractResponse(**result)
 
 
+@app.post("/verify", response_model=VerifyResponse)
+async def verify(
+    file: UploadFile = File(...),
+    allow_ocr: bool = Query(
+        True,
+        description=(
+            "Route scanned PDFs (no text layer) through the OCR pipeline for "
+            "the extract step. Set false to fast-fail scanned PDFs with 422."
+        ),
+    ),
+    extractor: str = Query(DEFAULT_EXTRACTOR, description=_EXTRACTOR_DESC),
+    check_existence: bool = Query(
+        True,
+        description=(
+            "Run the Layer-2 existence lookup against the live portal "
+            "(network, ~1-3s). Set false to skip it for a fast, offline-only "
+            "verification (forgery + extract only)."
+        ),
+    ),
+    check_citations: bool = Query(
+        True,
+        description=(
+            "Run Layer-1 (cited-law existence) + Layer-3 (sentencing-frame) "
+            "checks on the extracted citations against the BLHS 2015 DB. "
+            "Offline/fast (DB lookup only, no network). Set false to skip."
+        ),
+    ),
+):
+    """Full verification chain: L4 forgery + extract + L2 existence + L1/L3 citation.
+
+    Synchronous (blocks until done). For SCANNED PDFs the OCR step can take
+    minutes — use the async variant ``POST /jobs/verify`` (submit -> job_id ->
+    poll GET /jobs/{id}) so the HTTP request returns immediately.
+
+    Returns 200 with a combined report. The existence lookup is best-effort: a
+    missing case number or a portal error never fails the request — it is
+    reported as skipped/error inside the ``existence`` block. Citation checks
+    (L1/L3) run offline against the BLHS 2015 DB and likewise never fail the
+    request. The result is decision support, NOT a binary real/fake verdict.
+    """
+    if not holder.loaded:
+        raise HTTPException(status_code=503, detail="model not loaded yet")
+
+    if extractor not in EXTRACTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown extractor {extractor!r}; expected one of {list(EXTRACTORS)}",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload")
+
+    if not looks_like_pdf(data, file.content_type):
+        raise HTTPException(
+            status_code=400,
+            detail="uploaded file is not a PDF (expected %PDF magic bytes or a PDF content-type)",
+        )
+
+    try:
+        result = run_verify(
+            file.filename or "upload.pdf",
+            data,
+            holder,
+            allow_ocr=allow_ocr,
+            extractor=extractor,
+            check_existence_online=check_existence,
+            check_citations_offline=check_citations,
+        )
+    except NotAPdfError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ScannedPdfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return VerifyResponse(**result)
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(req: AnalyzeRequest):
+    """Phân tích so sánh: đối chiếu các điều luật bản án viện dẫn với kho luật.
+
+    Điều phối 2 lượt RAG tới Module 1 (KHÔNG đi qua validate_document):
+      1. tra cứu nội dung từng điều luật được viện dẫn (intent 'legal' -> retrieve);
+      2. tổng hợp so sánh tội danh / khung hình phạt (câu tư vấn).
+
+    Nhận dữ liệu đã bóc tách (case_meta + entities_grouped) từ /extract hoặc
+    /verify, nên KHÔNG cần upload lại PDF. Đồng bộ, có thể mất ~1-3 phút (2 lượt
+    gọi LLM); client nên đặt timeout dài.
+    """
+    from api.analyze import AnalyzeError, run_analyze
+
+    case_meta = req.case_meta.model_dump() if req.case_meta else {}
+    grouped = {
+        k: [e.model_dump() for e in v] for k, v in req.entities_grouped.items()
+    }
+    try:
+        result = run_analyze(
+            case_meta, grouped, model=req.rag_model, llm_model=req.llm_model
+        )
+    except AnalyzeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return AnalyzeResponse(**result)
+
+
+@app.post("/analyze/stream")
+async def analyze_stream(req: AnalyzeRequest):
+    """Như /analyze nhưng STREAM kết quả (SSE) để client hiện dần, không chờ 1-3 phút.
+
+    Trả về text/event-stream với các chunk 'data: {...}' kiểu OpenAI (giống
+    /v1/chat/completions của Module 1) — client dùng lại bộ đọc SSE của chat.
+    """
+    from api.analyze import stream_analyze
+
+    case_meta = req.case_meta.model_dump() if req.case_meta else {}
+    grouped = {
+        k: [e.model_dump() for e in v] for k, v in req.entities_grouped.items()
+    }
+    return StreamingResponse(
+        stream_analyze(case_meta, grouped, model=req.rag_model, llm_model=req.llm_model),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/analyze/deep/stream")
+async def analyze_deep_stream(req: AnalyzeRequest):
+    """Phân tích CHUYÊN SÂU bản chất hành vi (STREAM, SSE).
+
+    2 bước: (1) tóm tắt diễn biến hành vi từ phần 'NỘI DUNG VỤ ÁN' của bản án;
+    (2) phân tích 4 chiều — cấu thành tội phạm, định tội (có thể tội khác?), tính
+    hợp lý của hình phạt, logic & chứng cứ. CẦN trường ``text`` (toàn văn bản án).
+    Đây là phân tích HỖ TRỢ/học thuật, KHÔNG phải kết luận pháp lý có thẩm quyền.
+    """
+    from api.analyze import stream_deep_analyze
+
+    case_meta = req.case_meta.model_dump() if req.case_meta else {}
+    grouped = {
+        k: [e.model_dump() for e in v] for k, v in req.entities_grouped.items()
+    }
+    return StreamingResponse(
+        stream_deep_analyze(
+            case_meta, grouped, req.text, model=req.rag_model, llm_model=req.llm_model
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/analyze/ask/stream")
+async def analyze_ask_stream(req: AskRequest):
+    """HYBRID hỏi-đáp về CHÍNH bản án (STREAM, SSE).
+
+    Chunk + embed toàn văn bản án (RAG trên chính bản án, bền cho mọi độ dài) để
+    lấy đoạn liên quan câu hỏi, kết hợp với RAG kho luật của Module 1 rồi trả lời.
+    Hỏi nhiều câu tuỳ ý, có nhớ ngữ cảnh hội thoại (history).
+    """
+    from api.analyze import stream_ask
+
+    history = [t.model_dump() for t in req.history]
+    case_meta = req.case_meta.model_dump() if req.case_meta else None
+    grouped = {
+        k: [e.model_dump() for e in v] for k, v in (req.entities_grouped or {}).items()
+    }
+    return StreamingResponse(
+        stream_ask(
+            req.text, req.question, history,
+            case_meta=case_meta, grouped=grouped,
+            model=req.rag_model, llm_model=req.llm_model,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# /precedents — kho tiền lệ cục bộ + so khớp bản án tương tự (án lệ + đã xác nhận)
+# ---------------------------------------------------------------------------
+
+
+def _grouped_dicts(entities_grouped) -> dict:
+    return {
+        k: [e.model_dump() for e in v] for k, v in (entities_grouped or {}).items()
+    }
+
+
+@app.post("/precedents/add", response_model=PrecedentAddResponse)
+async def precedents_add(req: PrecedentAddRequest):
+    """Lưu một bản án đã trích xuất vào kho tiền lệ (mặc định source='confirmed')."""
+    from api.precedent_store import build_case, embed_case, get_store
+
+    case_meta = req.case_meta.model_dump() if req.case_meta else None
+    case = build_case(case_meta, _grouped_dicts(req.entities_grouped), req.text)
+    vec = embed_case(case)
+    if vec.size == 0:
+        raise HTTPException(status_code=503, detail="Không embed được (Module 1 /v1/embed?)")
+    store = get_store()
+    rid = store.add(case, vec, source=req.source or "confirmed", title=req.title, url=req.url)
+    return PrecedentAddResponse(id=rid, total=store.count())
+
+
+@app.post("/precedents/match", response_model=PrecedentMatchResponse)
+async def precedents_match(req: PrecedentMatchRequest):
+    """Tìm các tiền lệ/bản án tương tự nhất với bản án đang xem."""
+    from api.precedent_store import build_case, embed_case, get_store
+
+    case_meta = req.case_meta.model_dump() if req.case_meta else None
+    case = build_case(case_meta, _grouped_dicts(req.entities_grouped), req.text)
+    vec = embed_case(case)
+    if vec.size == 0:
+        raise HTTPException(status_code=503, detail="Không embed được (Module 1 /v1/embed?)")
+    store = get_store()
+    matches = store.match(case, vec, top_k=req.top_k, sources=req.sources)
+    return PrecedentMatchResponse(
+        matches=matches, query_crimes=case["crimes"], query_articles=case["articles"]
+    )
+
+
+@app.post("/precedents/search", response_model=PrecedentMatchResponse)
+async def precedents_search(req: PrecedentSearchRequest):
+    """Tìm kiếm tiền lệ TRỰC TIẾP bằng câu/từ khoá tự do (không cần upload bản án)."""
+    from api.judgment_rag import _embed
+    from api.precedent_store import get_store
+
+    if not (req.query or "").strip():
+        raise HTTPException(status_code=400, detail="Thiếu 'query'")
+    vec = _embed([req.query])
+    if vec.size == 0:
+        raise HTTPException(status_code=503, detail="Không embed được (Module 1 /v1/embed?)")
+    store = get_store()
+    matches = store.search(req.query, vec, top_k=req.top_k, sources=req.sources)
+    return PrecedentMatchResponse(matches=matches, query_crimes=[], query_articles=[])
+
+
+@app.get("/precedents", response_model=PrecedentStatsResponse)
+async def precedents_stats():
+    """Thống kê kho tiền lệ (tổng / án lệ / đã xác nhận)."""
+    from api.precedent_store import get_store
+
+    store = get_store()
+    return PrecedentStatsResponse(
+        total=store.count(), an_le=store.count("an_le"), confirmed=store.count("confirmed")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Async job queue — submit slow (scanned-PDF OCR) work without blocking HTTP.
 # Submit -> {job_id, status:"queued"} (202) -> poll GET /jobs/{id} for result.
@@ -284,6 +551,35 @@ async def submit_extract_job(
         "extract",
         file.filename or "upload.pdf",
         {"allow_ocr": allow_ocr, "extractor": extractor},
+        data,
+    )
+    return _submit_response(job_id, request)
+
+
+@app.post("/jobs/verify", response_model=JobSubmitResponse, status_code=202)
+async def submit_verify_job(
+    request: Request,
+    file: UploadFile = File(...),
+    allow_ocr: bool = Query(True, description="route scans through OCR (else job errors)"),
+    extractor: str = Query(DEFAULT_EXTRACTOR, description=_EXTRACTOR_DESC),
+    check_existence: bool = Query(True, description="run Layer-2 portal lookup"),
+    check_citations: bool = Query(True, description="run Layer-1/3 citation checks"),
+):
+    """Enqueue a full verification job (async). Returns 202 + job_id immediately.
+
+    Use this for SCANNED PDFs. Poll GET /jobs/{job_id} until status=='done';
+    the result field then holds the full VerifyResponse.
+    """
+    data = await _read_and_validate(file, extractor)
+    job_id = jobs.submit_job(
+        "verify",
+        file.filename or "upload.pdf",
+        {
+            "allow_ocr": allow_ocr,
+            "extractor": extractor,
+            "check_existence": check_existence,
+            "check_citations": check_citations,
+        },
         data,
     )
     return _submit_response(job_id, request)

@@ -45,10 +45,9 @@ from pathlib import Path
 #   LEGAL_NER_ODL_HYBRID_PORT : port the hybrid backend server listens on
 #   LEGAL_NER_ODL_HYBRID_HOST : host for the hybrid backend (default 127.0.0.1)
 #   LEGAL_NER_ODL_HYBRID_TIMEOUT_MS : per-request hybrid timeout ms (0 = none)
-# Empty default: this bundle defaults to the pure-Python ``pymupdf`` extractor,
-# which needs no Java. Only the OPTIONAL ``opendataloader`` extractor needs a
-# JDK 11+ — set LEGAL_NER_ODL_JAVA_HOME to your JDK home to enable it.
-DEFAULT_JAVA_HOME = os.environ.get("LEGAL_NER_ODL_JAVA_HOME", "")
+DEFAULT_JAVA_HOME = os.environ.get(
+    "LEGAL_NER_ODL_JAVA_HOME", "/home/tts/jdk/jdk-21.0.11+10"
+)
 DEFAULT_HYBRID_PORT = os.environ.get("LEGAL_NER_ODL_HYBRID_PORT", "5002")
 DEFAULT_HYBRID_HOST = os.environ.get("LEGAL_NER_ODL_HYBRID_HOST", "127.0.0.1")
 DEFAULT_HYBRID_TIMEOUT_MS = os.environ.get("LEGAL_NER_ODL_HYBRID_TIMEOUT_MS", "0")

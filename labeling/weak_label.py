@@ -82,15 +82,6 @@ def main() -> None:
     parser.add_argument("--out", default=str(LABELED_DIR), help="output dir (default: data/labeled)")
     parser.add_argument("--print-entities", action="store_true",
                         help="print every matched entity span")
-    parser.add_argument("--basename", default="weak_labels",
-                        help="output basename: writes <basename>.jsonl + "
-                             "<basename-spans>.jsonl (default: weak_labels)")
-    parser.add_argument("--id-prefix", default="",
-                        help="prepend to each doc id (e.g. 'civil_') to avoid "
-                             "id collisions when merging criminal+civil corpora")
-    parser.add_argument("--append", action="store_true",
-                        help="append to existing output files instead of overwriting "
-                             "(used to merge a second corpus into the same dataset)")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -107,8 +98,7 @@ def main() -> None:
     docs_with_entities = 0
 
     for path in txt_files:
-        doc_id = f"{args.id_prefix}{path.stem}"
-        records, spans, meta = label_document(doc_id, path.read_text(encoding="utf-8"))
+        records, spans, meta = label_document(path.stem, path.read_text(encoding="utf-8"))
         all_records.extend(records)
         if spans:
             docs_with_entities += 1
@@ -116,7 +106,7 @@ def main() -> None:
             type_counts[s.label] += 1
         # one record per document: doc-level metadata + all spans
         span_dump.append({
-            "doc": doc_id,
+            "doc": path.stem,
             "meta": meta,  # case_number / case_type / procedure_stage
             "spans": [{"label": s.label, "start": s.start, "end": s.end,
                        "text": s.text} for s in spans],
@@ -126,15 +116,12 @@ def main() -> None:
             for s in spans:
                 print(f"  [{s.label:13s}] {s.text}")
 
-    mode = "a" if args.append else "w"
-    bio_path = out_dir / f"{args.basename}.jsonl"
-    with bio_path.open(mode, encoding="utf-8") as f:
+    bio_path = out_dir / "weak_labels.jsonl"
+    with bio_path.open("w", encoding="utf-8") as f:
         for rec in all_records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    spans_path = out_dir / f"{args.basename.replace('labels', 'spans')}.jsonl"
-    if "spans" not in spans_path.name:
-        spans_path = out_dir / f"{args.basename}_spans.jsonl"
-    with spans_path.open(mode, encoding="utf-8") as f:
+    spans_path = out_dir / "weak_spans.jsonl"
+    with spans_path.open("w", encoding="utf-8") as f:
         for row in span_dump:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 

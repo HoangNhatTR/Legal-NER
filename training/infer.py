@@ -315,7 +315,7 @@ def infer_entities(text: str, model, tokenizer, device,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract legal entities from a judgment")
-    parser.add_argument("--model", default=str(MODELS_DIR / "legal-ner" / "final"),
+    parser.add_argument("--model", default=str(MODELS_DIR / "legal-ner-v3r-full" / "final"),
                         help="fine-tuned checkpoint dir")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--pdf", help="judgment PDF (text layer required)")

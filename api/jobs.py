@@ -67,9 +67,7 @@ _DB_PATH = _DATA_DIR / "jobs.db"
 _UPLOAD_DIR = _DATA_DIR / "job_uploads"
 
 VALID_STATUSES = ("queued", "running", "done", "error")
-# This NER-only bundle ships the extract job kind only; the verification job
-# kind ("verify") was removed along with the verify/ layer.
-VALID_KINDS = ("extract",)
+VALID_KINDS = ("extract", "verify")
 
 
 def _now() -> str:

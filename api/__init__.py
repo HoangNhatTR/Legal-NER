@@ -1,1 +1,1 @@
-"""Legal NER inference bundle: api package."""
+"""FastAPI service wrapping the Model 1 legal-NER pipeline (v1)."""

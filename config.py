@@ -63,23 +63,11 @@ CIVIL_MARKERS = (
 # NER label inventory (BIO scheme)
 # ---------------------------------------------------------------------------
 # v3r schema: 31 entity types -> 63 BIO tags (O + B-/I- per type).
-# (v3 was 32 entity types -> 65 BIO tags; v2 was 20 -> 41.) v3r drops the
-# legacy VIOLATION_ACT label, consolidating act narratives into CRIMINAL_ACT
-# (see note below). Because VIOLATION_ACT sat in the MIDDLE of the list, the
-# label ids of every entity AFTER it (PENALTY, MONEY_AMOUNT, ... and all 12
-# dynamic labels) shift by one vs v3 — v3r is trained from scratch, so this is
-# fine. The BIO tag list / LABEL2ID / ID2LABEL all derive from ENTITY_TYPES
-# below and regenerate automatically.
-#
-# VIOLATION_ACT vs CRIMINAL_ACT (v3r CONSOLIDATION):
-# v3 kept BOTH labels, but they fired on the IDENTICAL anchor
-# ("(có|đã|thực hiện) hành vi ...") and so split the act-narrative signal:
-# VIOLATION_ACT won most spans (1130) while CRIMINAL_ACT was starved (109,
-# F1=0.0). Per NER_UPGRADE_PLAN, CRIMINAL_ACT is the *upgrade* of the sparse
-# VIOLATION_ACT. v3r therefore CONSOLIDATES: VIOLATION_ACT is DROPPED and ALL
-# act narrative routes to the single, richer CRIMINAL_ACT label (one act
-# label, full signal). Anti-regression no longer applies to VIOLATION_ACT
-# (it no longer exists) — this is expected and accepted by the recovery plan.
+# This MUST match the served checkpoint's config.json id2label
+# (legal-ner-v3r-full, micro-F1 ~0.970). The legacy VIOLATION_ACT label was
+# DROPPED and its act-narrative signal consolidated into CRIMINAL_ACT; that
+# shifts the id of every label after it vs the old 20-label schema, so the
+# v3r-full model was trained from scratch on this inventory.
 ENTITY_TYPES = [
     # A. document metadata
     "CASE_NUMBER",    # judgment/decision number: "17/2018/HS-ST"
@@ -99,33 +87,30 @@ ENTITY_TYPES = [
     "LEGAL_BASIS",    # full "Căn cứ ..."/"Áp dụng ..." citation sentences
     # D. offense
     "CRIME",          # offense name (quoted or unquoted)
-    # (v3r) VIOLATION_ACT dropped — consolidated into CRIMINAL_ACT (see note above)
+    # (v3r) VIOLATION_ACT dropped — consolidated into CRIMINAL_ACT (below)
     # E. outcome
     "PENALTY",        # "02 (hai) năm tù", "tù chung thân", "án treo", ...
     "MONEY_AMOUNT",   # money NOT in compensation/fee context
     "COMPENSATION",   # money in "bồi thường" context
     "COURT_FEE",      # money in "án phí / lệ phí" context
     "DECISION",       # verdict-sentence remainder in QUYET DINH section
-    # -----------------------------------------------------------------------
-    # v3 NEW (12) -- "dynamic" labels (NER_UPGRADE_PLAN Pillar A)
-    # -----------------------------------------------------------------------
-    # F. people conducting the proceedings (strong anchors -> regex)
-    "JUDGE",              # name after "Thẩm phán" / "Chủ tọa phiên tòa"
-    "ASSESSOR",           # name after "Hội thẩm nhân dân"
-    "PROSECUTOR",         # name after "Kiểm sát viên"
-    "CLERK",              # name after "Thư ký phiên tòa" / "Thư ký"
-    "LAWYER",             # name after "Luật sư" / "người bào chữa"
-    "WITNESS",            # name after "người làm chứng"
-    # G. courtroom behavior / procedural status (bounded short spans)
+    # F. people conducting the proceedings
+    "JUDGE",              # "Thẩm phán" / "Chủ tọa phiên tòa"
+    "ASSESSOR",           # "Hội thẩm nhân dân"
+    "PROSECUTOR",         # "Kiểm sát viên"
+    "CLERK",              # "Thư ký phiên tòa"
+    "LAWYER",             # "Luật sư" / "người bào chữa"
+    "WITNESS",            # "người làm chứng"
+    # G. courtroom behavior / procedural status
     "COURT_BEHAVIOR",     # "có mặt", "vắng mặt", "kháng cáo", "xin giảm nhẹ", ...
-    # H. sentencing factors (gazetteer Điều 51/52 BLHS 2015)
+    # H. sentencing factors (Điều 51/52 BLHS 2015)
     "MITIGATING_FACTOR",  # tình tiết giảm nhẹ (Điều 51)
     "AGGRAVATING_FACTOR", # tình tiết tăng nặng (Điều 52)
-    # I. criminal act narrative (richer upgrade of VIOLATION_ACT; stays weak)
-    "CRIMINAL_ACT",       # act narrative after "có hành vi"/"thực hiện hành vi"/"đã ..."
+    # I. criminal act narrative (upgrade of the dropped VIOLATION_ACT)
+    "CRIMINAL_ACT",       # act narrative after "có hành vi"/"thực hiện hành vi"
     # J. quantities & physical evidence
-    "QUANTITY",           # "0,1488 gam", "01 viên", "X kg", "X gói"
-    "EVIDENCE_ITEM",      # tang vật / vật chứng: "01 xe mô tô ...", "01 điện thoại ..."
+    "QUANTITY",           # "0,1488 gam", "01 viên", "X kg"
+    "EVIDENCE_ITEM",      # tang vật / vật chứng: "01 xe mô tô ...", "01 điện thoại"
 ]
 
 LABELS = ["O"]
@@ -145,7 +130,7 @@ MAX_SEQ_LENGTH = 256
 CHUNK_TOKENS = 150
 
 # ---------------------------------------------------------------------------
-# Inference windowing
+# Inference windowing (v3r-full)
 # ---------------------------------------------------------------------------
 # A forward pass sees at most INFER_WINDOW syllable tokens. INFER_STRIDE is the
 # advance between consecutive windows; the (WINDOW - STRIDE) overlap keeps an
@@ -153,18 +138,14 @@ CHUNK_TOKENS = 150
 INFER_WINDOW = 200          # syllable tokens per window
 INFER_STRIDE = 150          # advance per window (50-token overlap)
 # Subword budget for ONE forward pass. xlm-roberta supports 512 positions; a
-# window is at most INFER_WINDOW + (INFER_WINDOW - INFER_STRIDE) = 250 syllables
-# (the sentence-extension hard cap), which is ~320 subwords on dense judgment
-# prose (money/dates/case-numbers/foreign names tokenize >1 subword each). The
-# old 256 cap silently TRUNCATED such windows: the tail syllables produced no
-# word_ids and were left "O" — a real recall hole at section/sentence cuts.
-# 512 covers the 250-syllable hard cap for any realistic subword ratio (<2.0)
-# so no in-window syllable is ever dropped. Sequences shorter than this are
-# unaffected (padding/truncation only ever applied at the cap).
+# window can reach INFER_WINDOW + (INFER_WINDOW - INFER_STRIDE) = 250 syllables
+# (the sentence-extension hard cap) ≈ ~320 subwords on dense judgment prose. The
+# old 256 cap silently TRUNCATED such windows (tail syllables produced no
+# word_ids → left "O", a recall hole). 512 covers the hard cap for any realistic
+# subword ratio (<2.0) so no in-window syllable is dropped.
 INFER_MAX_SUBWORDS = 512
 # Section-aware inference (default): windows never cross a major-section
-# boundary (PREAMBLE / NHÂN DANH / NỘI DUNG / NHẬN ĐỊNH / QUYẾT ĐỊNH), and a
-# section longer than INFER_WINDOW is sub-chunked at SENTENCE boundaries near
-# the target size rather than cut mid-token. Set False to fall back to the
-# legacy blind sliding window (for before/after comparison).
+# boundary (PREAMBLE / NHÂN DANH / NỘI DUNG / NHẬN ĐỊNH / QUYẾT ĐỊNH); a section
+# longer than INFER_WINDOW is sub-chunked at SENTENCE boundaries. Set False for
+# the legacy blind sliding window (before/after comparison).
 INFER_SECTION_AWARE = True

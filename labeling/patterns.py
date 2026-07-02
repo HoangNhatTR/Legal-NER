@@ -24,12 +24,8 @@ OVERLAP PRIORITY POLICY (flat BIO -- one label per token):
      left-to-right (greedy keep in `_resolve`).
 """
 
-from __future__ import annotations
-
 import re
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Character classes
@@ -337,360 +333,35 @@ DECISION_RE = re.compile(
 )
 QUYET_DINH_MARKER_RE = re.compile(r"QUYẾT\s+ĐỊNH\s*:?")
 
-# ===========================================================================
-# v3 NEW LABELS (NER_UPGRADE_PLAN Pillar A)
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# F. Procedural people -- JUDGE / ASSESSOR / PROSECUTOR / CLERK / LAWYER /
-# WITNESS. Unlike the anonymized parties (DEFENDANT...), the procedural panel
-# is written with FULL proper names ("Thẩm phán - Chủ tọa phiên tòa: Ông
-# Nguyễn Hồng Thanh"). We capture the full name after the role anchor + an
-# optional honorific. The name is a run of capitalized words; it terminates
-# before a role keyword / list separator / "sinh"/"Đoàn"/"thuộc"/"-".
-# The anchor itself stays O (only the NAME is labeled), mirroring PARTY_RES.
-# ---------------------------------------------------------------------------
-# A full (non-anonymized) Vietnamese name: 2..5 capitalized words. Require at
-# least TWO words so a single trailing capitalized stopword ("Kiểm sát viên.
-# Trong") cannot be mistaken for a name.
-_FULLNAME = rf"{CAP_WORD}(?:\s+{CAP_WORD}){{1,4}}"
-# glue between anchor and name: ":"/bullets/list-no + optional honorific
-_PROC_GLUE = rf"\s*[:\-–]?\s*(?:\d+\.\s*)?(?:[+\-–]\s*)?(?:{_HONORIFIC}\s+)?"
-
-# Words that must terminate a procedural name (next role / clause start).
-_PROC_NAME_STOP = (
-    r"(?=\s+(?:Các|Hội|Thẩm|Kiểm|Thư|Luật|Người|Đại|Đoàn|Công|Viện|Tòa|Toà"
-    r"|sinh|SN|Sinh|năm|thuộc|nguyên|trú|Trong|Tại|Ông|Bà|Anh|Chị|đại\s+diện"
-    r"|với|bào\s+chữa|kiểm\s+sát|làm\s+chứng)\b"
-    r"|\s*[,.;:()\d]|$)"
-)
-
-PROC_PEOPLE_RES = {
-    # "Thẩm phán - Chủ tọa phiên tòa: Ông Nguyễn Hồng Thanh", "Thẩm phán: Ông..."
-    "JUDGE": re.compile(
-        rf"(?:Thẩm\s+phán(?:\s*[-–]\s*Chủ\s+tọa\s+phiên\s+tòa)?|Chủ\s+tọa\s+phiên\s+tòa)"
-        rf"{_PROC_GLUE}({_FULLNAME}){_PROC_NAME_STOP}"
-    ),
-    # "Hội thẩm nhân dân: Ông Nguyễn Thành Công"
-    "ASSESSOR": re.compile(
-        rf"Hội\s+thẩm(?:\s+nhân\s+dân)?{_PROC_GLUE}({_FULLNAME}){_PROC_NAME_STOP}"
-    ),
-    # "Kiểm sát viên: Ông Cao Tấn N" OR the common header form
-    # "Đại diện Viện kiểm sát nhân dân ... tham gia phiên tòa: Ông <NAME>".
-    # The bare "Kiểm sát viên." with no following name will NOT match
-    # (_FULLNAME needs >=2 capitalized words before a stop).
-    "PROSECUTOR": re.compile(
-        r"(?:Đại\s+diện\s+Viện\s+[Kk]iểm\s+sát[^:.\n]{0,80}?tham\s+gia\s+phiên\s+tòa"
-        r"|Kiểm\s+sát\s+viên(?:\s*[-–]\s*Thư\s+k[íý]\s+phiên\s+tòa)?)"
-        rf"\s*[:\-–]\s*(?:\d+\.\s*)?(?:[+\-–]\s*)?(?:{_HONORIFIC}\s+)?"
-        rf"({_FULLNAME}){_PROC_NAME_STOP}"
-    ),
-    # "Thư ký phiên tòa: Bà Võ Thị Ánh Trúc", "Thư ký: ..."
-    "CLERK": re.compile(
-        rf"Thư\s+ký(?:\s+phiên\s+tòa|\s+Tòa\s+án)?{_PROC_GLUE}({_FULLNAME}){_PROC_NAME_STOP}"
-    ),
-    # "Người bào chữa: Luật sư Trần Nhật N", "Luật sư Trần Nhật N"
-    "LAWYER": re.compile(
-        rf"(?:Người\s+bào\s+chữa\s*:?\s*)?Luật\s+sư{_PROC_GLUE}({_FULLNAME}){_PROC_NAME_STOP}"
-    ),
-    # "Người làm chứng là chị Nguyễn Thị Mai H", "Người làm chứng: Anh Đặng Phú V"
-    "WITNESS": re.compile(
-        rf"[Nn]gười\s+làm\s+chứng(?:\s+là)?{_PROC_GLUE}({_FULLNAME}){_PROC_NAME_STOP}"
-    ),
-}
-
-# Capitalized first-tokens that are never a procedural name (sentence/section
-# openers that can follow an anchor). Reuses the party stopword set + a few
-# procedural extras.
-_PROC_FIRST_STOP = _NAME_STOPWORDS | {
-    "Trong", "Tại", "Đại", "Đoàn", "Với", "Nhất", "Đề", "Phát", "Sau", "Trước",
-    "Vắng", "Có", "Đã", "Phiên", "Hôm", "Cùng", "Kiểm", "Viện",
-}
-
-# ---------------------------------------------------------------------------
-# G. COURT_BEHAVIOR -- procedural status / behavior at trial. Bounded SHORT
-# spans (the cue phrase only, optionally with a tight object). NOT sentencing
-# factors: "thành khẩn khai báo"/"ăn năn hối cải" belong to MITIGATING_FACTOR
-# and win on priority (see PRIORITY below).
-# ---------------------------------------------------------------------------
-COURT_BEHAVIOR_RES = [
-    re.compile(r"(?:vắng|có)\s+mặt(?:\s+tại\s+phiên\s+tòa)?"),
-    re.compile(r"kháng\s+cáo(?:\s+(?:xin\s+giảm\s+nhẹ(?:\s+hình\s+phạt)?"
-               r"|toàn\s+bộ\s+bản\s+án|kêu\s+oan|xin\s+hưởng\s+án\s+treo))?"),
-    re.compile(r"kháng\s+nghị"),
-    re.compile(r"xin\s+giảm\s+nhẹ(?:\s+hình\s+phạt)?"),
-    re.compile(r"xin\s+hưởng\s+án\s+treo"),
-    re.compile(r"thay\s+đổi\s+lời\s+khai"),
-    re.compile(r"(?:ra\s+)?tự\s+thú"),
-    re.compile(r"đầu\s+thú"),
-    re.compile(r"từ\s+chối\s+(?:khai\s+báo|luật\s+sư)"),
-    re.compile(r"rút\s+(?:một\s+phần\s+)?kháng\s+cáo"),
-]
-
-# ---------------------------------------------------------------------------
-# H. MITIGATING_FACTOR / AGGRAVATING_FACTOR -- gazetteer match (Điều 51/52).
-# We match diacritic-insensitively: build one alternation regex over the
-# NORMALIZED phrases, then map back to char offsets on a normalized view that
-# is index-aligned to the original text. To keep offsets aligned, we normalize
-# WITHOUT changing length: lowercase + diacritic fold are 1:1 on these scripts
-# except 'đ' (still 1 char). So a char-parallel fold preserves indices.
-# ---------------------------------------------------------------------------
-_GAZ_MIT_NORMS: list[str] = []
-_GAZ_AGG_NORMS: list[str] = []
-_MIT_RE: re.Pattern | None = None
-_AGG_RE: re.Pattern | None = None
-
-
-def _fold_keep_len(text: str) -> str:
-    """Lowercase + strip diacritics WITHOUT changing string length.
-
-    Vietnamese precomposed vowels are single code points; NFD would expand
-    them and break offset alignment, so we map each char to its ASCII base
-    via a per-char table. 'đ'->'d'. Anything else passes through lowered.
-    """
-    import unicodedata
-    out = []
-    for ch in text:
-        low = ch.lower()
-        if low == "đ":
-            out.append("d")
-            continue
-        d = unicodedata.normalize("NFD", low)
-        base = "".join(c for c in d if unicodedata.category(c) != "Mn")
-        # keep length stable: a precomposed vowel folds to exactly 1 base char
-        out.append(base[:1] if base else low)
-    return "".join(out)
-
-
-def _load_gazetteer_regexes() -> None:
-    global _GAZ_MIT_NORMS, _GAZ_AGG_NORMS, _MIT_RE, _AGG_RE
-    if _MIT_RE is not None:
-        return
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from labeling.gazetteer import load_gazetteer  # noqa: E402
-
-    gz = load_gazetteer()
-    # phrase norms in gazetteer collapse punctuation to spaces; for offset-safe
-    # matching we re-fold each phrase keeping length, then turn runs of
-    # non-alnum into a flexible "\s*[^\w]*\s*"-ish separator.
-    def _to_regex(phrases: list[str]) -> re.Pattern:
-        alts = []
-        for p in sorted(set(phrases), key=len, reverse=True):
-            folded = _fold_keep_len(p)
-            # split on non-alphanumeric; rejoin with a tolerant separator that
-            # also matches the folded text's own separators/whitespace.
-            parts = [re.escape(tok) for tok in re.split(r"[^\w]+", folded) if tok]
-            if not parts:
-                continue
-            alts.append(r"\s*[^\w]*\s*".join(parts))
-        return re.compile(r"(?<![\w])(?:" + "|".join(alts) + r")(?![\w])")
-
-    _GAZ_MIT_NORMS = [r["phrase"] for r in gz["mitigating"]]
-    _GAZ_AGG_NORMS = [r["phrase"] for r in gz["aggravating"]]
-    _MIT_RE = _to_regex(_GAZ_MIT_NORMS)
-    _AGG_RE = _to_regex(_GAZ_AGG_NORMS)
-
-
-def _find_factors(text: str) -> list[Span]:
-    _load_gazetteer_regexes()
-    folded = _fold_keep_len(text)  # index-aligned to `text`
-    out: list[Span] = []
-    for m in _MIT_RE.finditer(folded):
-        out.append(Span(m.start(), m.end(), "MITIGATING_FACTOR", text[m.start():m.end()]))
-    for m in _AGG_RE.finditer(folded):
-        out.append(Span(m.start(), m.end(), "AGGRAVATING_FACTOR", text[m.start():m.end()]))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# I. CRIMINAL_ACT -- richer act narrative; conservative anchors. This is the
-# go-forward upgrade of VIOLATION_ACT (kept separate for anti-regression). The
-# plan acknowledges this stays weak/noisy, so we keep it precision-leaning:
-# anchor on "có hành vi"/"thực hiện hành vi"/"đã thực hiện hành vi" and capture
-# the clause up to the first break. LOW priority -> nested CRIME / QUANTITY /
-# EVIDENCE_ITEM win inside it.
-# ---------------------------------------------------------------------------
-CRIMINAL_ACT_RE = re.compile(
-    r"(?:có|đã\s+(?:thực\s+hiện|có)|thực\s+hiện)\s+hành\s+vi\s+"
-    r"(?!phạm\s+tội\s+quả\s+tang\b)"
-    r"([^.;]{10,200}?)"
-    r"(?=(?<!\d)[.;](?!\d)|$)"
-)
-
-# ---------------------------------------------------------------------------
-# J. QUANTITY -- number + unit (drugs/weights/counts). Vietnamese decimal uses
-# a comma ("0,1488 gam"); thousands use a dot. Units cover mass / volume /
-# count / pieces. Optional spelled-out parenthetical ("01 (một) viên").
-# ---------------------------------------------------------------------------
-_QTY_UNIT = (
-    r"(?:gam|gram|gr|kg|kilogam|mg|miligam|g"
-    r"|viên|gói|tép|cây|chỉ|lượng|bánh|cục|tờ|tép"
-    r"|ml|lít|cc|cm3|m3|kg/|tấn|tạ|yến)"
-)
-QUANTITY_RE = re.compile(
-    r"\b\d{1,3}(?:[.,]\d{1,4})?\s*(?:\([^)]{1,30}\)\s*)?" + _QTY_UNIT + r"\b"
-)
-# "trọng lượng (là)? 0,1072 g" / "khối lượng 1,5 kg" -- anchor variant so a
-# bare weight after the cue is still caught even if unit spacing is odd.
-QUANTITY_WEIGHT_RE = re.compile(
-    r"(?:trọng\s+lượng|khối\s+lượng)\s*(?:là)?\s*:?\s*"
-    r"(\d{1,3}(?:[.,]\d{1,4})?\s*" + _QTY_UNIT + r")\b"
-)
-
-# ---------------------------------------------------------------------------
-# K. EVIDENCE_ITEM -- physical exhibits. Two cues:
-#   (a) item enumeration "01 <noun phrase>" inside a vật chứng/tang vật block;
-#   (b) a standalone "01 xe mô tô ..." / "01 điện thoại ..." enumeration.
-# Captures the count + the item noun phrase up to a clause break. Higher
-# priority than QUANTITY so "01 xe mô tô Wave" stays ONE evidence span (not a
-# QUANTITY "01" + tail); but for drug weights QUANTITY still wins because the
-# unit there (gam/viên) is matched by QUANTITY and EVIDENCE requires an item
-# noun, not a unit.
-# ---------------------------------------------------------------------------
-_EVIDENCE_NOUN = (
-    r"(?:xe|điện\s+thoại|xe\s+mô\s+tô|xe\s+máy|xe\s+ô\s+tô|mô\s+tô|ô\s+tô"
-    r"|dao|kiếm|súng|đao|mã\s+tấu|tuýp|thanh|cây|đoạn|sợi|cuộn|chiếc|cái"
-    r"|bộ|tờ|mảnh|gói|bao|túi|ví|laptop|máy\s+tính|sim|thẻ|đồng\s+hồ"
-    r"|nhẫn|dây\s+chuyền|vàng|ma\s+túy|hung\s+khí)"
-)
-EVIDENCE_ITEM_RE = re.compile(
-    r"\b0?\d{1,2}\s*(?:\([^)]{1,20}\)\s*)?" + _EVIDENCE_NOUN +
-    r"[^.;,:]{0,60}?(?=[.;,:]|\s+(?:và|trị\s+giá|do|của|đã|được)\b|$)"
-)
-# context window: an item enumeration only counts as evidence near a
-# vật chứng/tang vật cue (avoids labeling generic "01 xe" in the narrative).
-_EVIDENCE_CTX = re.compile(r"vật\s+chứng|tang\s+vật|xử\s+lý\s+vật\s+chứng|tịch\s+thu")
-_EVIDENCE_CTX_WINDOW = 200
-
-
-# Capitalized words that should never END a procedural name -- they begin the
-# NEXT role/section ("... Thanh Các Thẩm phán"). Trim them off the tail. Kept
-# DELIBERATELY SMALL: only unambiguous section-openers (NOT common given names
-# like "Công"/"Anh" that the regex stop already bounds correctly).
-_PROC_TAIL_STOP = {
-    "Các", "Hội", "Thẩm", "Kiểm", "Thư", "Luật", "Đại", "Đoàn",
-    "Viện", "Tòa", "Toà", "Ông", "Bà", "Trong", "Tại",
-    "Phiên", "Vào", "Ngày", "Hôm",
-}
-
-
-def _find_procedural_people(text: str) -> list[Span]:
-    out = []
-    for label, regex in PROC_PEOPLE_RES.items():
-        for m in regex.finditer(text):
-            words = m.group(1).split()
-            # trim trailing words that open the next role/section
-            while len(words) > 2 and words[-1] in _PROC_TAIL_STOP:
-                words.pop()
-            if len(words) < 2:
-                continue
-            first = words[0]
-            if first in _PROC_FIRST_STOP:
-                continue
-            name = " ".join(words)
-            # recompute end offset after trimming the tail
-            start = m.start(1)
-            end = start + len(text[m.start(1):m.end(1)].rsplit(words[-1], 1)[0]) + len(words[-1])
-            out.append(Span(start, end, label, text[start:end]))
-    return out
-
-
-def _find_court_behavior(text: str) -> list[Span]:
-    out = []
-    for rx in COURT_BEHAVIOR_RES:
-        for m in rx.finditer(text):
-            out.append(Span(m.start(), m.end(), "COURT_BEHAVIOR", m.group()))
-    return out
-
-
-def _find_quantity(text: str) -> list[Span]:
-    out = []
-    for m in QUANTITY_RE.finditer(text):
-        out.append(Span(m.start(), m.end(), "QUANTITY", m.group()))
-    for m in QUANTITY_WEIGHT_RE.finditer(text):
-        out.append(Span(m.start(1), m.end(1), "QUANTITY", m.group(1)))
-    return out
-
-
-def _find_evidence(text: str) -> list[Span]:
-    out = []
-    for m in EVIDENCE_ITEM_RE.finditer(text):
-        ctx = text[max(0, m.start() - _EVIDENCE_CTX_WINDOW): m.start()]
-        if _EVIDENCE_CTX.search(ctx):
-            out.append(Span(m.start(), m.end(), "EVIDENCE_ITEM", m.group()))
-    return out
-
-
-# Priority for overlap resolution: higher first. DECISION is handled
-# separately (gap filling) and is therefore strictly lowest.
-#
-# v3r ANTI-REGRESSION placement (recovery iteration):
-#   The v3 regressions (DECISION -.11, LEGAL_BASIS -.06, VICTIM -.044, CRIME
-#   -.03, LAW_NAME -.022, JUDGMENT_DATE -.02) were driven by the new dynamic
-#   labels (a) fragmenting DECISION's operative-zone gap-fill and (b) adding
-#   boundary noise around the fuzzy old labels. The diagnosis showed the OLD
-#   spans are 99.5-100% intact at the data level, so the fix is two-fold:
-#     1. PROTECT the high-value + fuzzy OLD labels by ranking them ABOVE the
-#        new dynamic labels on overlap (so any genuine overlap resolves in the
-#        OLD label's favor): LEGAL_BASIS, CRIME, LAW_NAME, VICTIM,
-#        JUDGMENT_DATE, the parties — all sit above EVIDENCE_ITEM / QUANTITY /
-#        COURT_BEHAVIOR / CRIMINAL_ACT.
-#     2. SCOPE the new dynamic labels (factors / COURT_BEHAVIOR / CRIMINAL_ACT)
-#        OUT of the QUYẾT ĐỊNH operative zone (see _OPERATIVE_SUPPRESS in
-#        find_entities) so they stop fragmenting DECISION there. Factors keep
-#        ~98% of their hits (they live in the NHẬN ĐỊNH narrative) — the
-#        upgrade's whole point is preserved.
-#
-# Retained v3 rationale:
-#   * Sentencing factors (Điều 51/52) BEAT COURT_BEHAVIOR so "thành khẩn khai
-#     báo"/"ăn năn hối cải" label as MITIGATING_FACTOR, not behavior.
-#   * Procedural people are specific anchors -> high priority.
-#   * EVIDENCE_ITEM > QUANTITY so "01 xe mô tô ..." stays one evidence span.
-#   * CRIMINAL_ACT is LOW (just above DECISION) so nested CRIME / QUANTITY /
-#     EVIDENCE_ITEM inside the act narrative win. (VIOLATION_ACT dropped — the
-#     act narrative is now a single CRIMINAL_ACT label.)
-PRIORITY = [
-    "LEGAL_BASIS",
-    "MITIGATING_FACTOR", "AGGRAVATING_FACTOR",
-    "COURT_FEE", "COMPENSATION",
-    "PENALTY", "CRIME",
-    "LAW_NAME",
-    "CASE_NUMBER", "COURT", "JUDGMENT_DATE", "CASE_TYPE",
-    "JUDGE", "ASSESSOR", "PROSECUTOR", "CLERK", "LAWYER", "WITNESS",
-    "DEFENDANT", "PLAINTIFF", "VICTIM", "RELATED_PARTY",
-    "ARTICLE", "CLAUSE", "POINT",
-    "EVIDENCE_ITEM", "QUANTITY",
-    "MONEY_AMOUNT",
-    "COURT_BEHAVIOR",
-    "CRIMINAL_ACT",
-    "DECISION",
-]
-
-
-# v3r: dynamic labels suppressed inside the QUYẾT ĐỊNH operative zone so they
-# stop fragmenting DECISION's contiguous gap-fill there. Factors + behavior +
-# act-narrative belong to the NHẬN ĐỊNH narrative; in the operative ruling the
-# only spans we want are the structured ones (PENALTY, MONEY, DEFENDANT,
-# EVIDENCE_ITEM, QUANTITY, ...) plus DECISION filling the gaps.
-_OPERATIVE_SUPPRESS = {
-    "COURT_BEHAVIOR",
-    "MITIGATING_FACTOR",
-    "AGGRAVATING_FACTOR",
-    "CRIMINAL_ACT",
-}
-
 
 def _operative_zone_start(text: str) -> int | None:
     """Char offset where the operative QUYẾT ĐỊNH ruling block begins.
 
-    Mirrors _decision_gaps: the LAST 'QUYẾT ĐỊNH' marker is the operative
-    header (earlier occurrences appear in the cover page / table of contents).
-    Returns None when the document has no operative section.
+    The LAST "QUYẾT ĐỊNH" marker is the operative header (earlier occurrences
+    appear in the cover page / table of contents). Returns None when the
+    document has no operative section. Used by corpus.sectioner (section-aware
+    inference) to align the QUYẾT ĐỊNH boundary with the weak-labeler.
     """
     end = None
     for m in QUYET_DINH_MARKER_RE.finditer(text):
         end = m.end()
     return end
+
+
+# Priority for overlap resolution: higher first. DECISION is handled
+# separately (gap filling) and is therefore strictly lowest.
+PRIORITY = [
+    "LEGAL_BASIS",
+    "COURT_FEE", "COMPENSATION",
+    "PENALTY", "CRIME",
+    "LAW_NAME",
+    "CASE_NUMBER", "COURT", "JUDGMENT_DATE", "CASE_TYPE",
+    "DEFENDANT", "PLAINTIFF", "VICTIM", "RELATED_PARTY",
+    "ARTICLE", "CLAUSE", "POINT",
+    "MONEY_AMOUNT",
+    "VIOLATION_ACT",
+    "DECISION",
+]
 
 
 @dataclass
@@ -819,35 +490,10 @@ def find_entities(text: str) -> list[Span]:
     spans += _spans(POINT_RE, text, "POINT")
     spans += _spans(CRIME_QUOTED_RE, text, "CRIME", group=1)
     spans += _spans(CRIME_UNQUOTED_RE, text, "CRIME", group=1)
-    # v3r: VIOLATION_ACT dropped; the act narrative is a single CRIMINAL_ACT
-    # label (consolidation — see config note). The CRIMINAL_ACT regex carries
-    # the full anchor set, so no act signal is lost.
-    spans += _spans(CRIMINAL_ACT_RE, text, "CRIMINAL_ACT", group=1)
+    spans += _spans(VIOLATION_ACT_RE, text, "VIOLATION_ACT", group=1)
     for rx in PENALTY_RES:
         spans += _spans(rx, text, "PENALTY")
     spans += _find_money(text)
-    # v3 new labels
-    spans += _find_procedural_people(text)
-    spans += _find_court_behavior(text)
-    spans += _find_factors(text)
-    spans += _find_quantity(text)
-    spans += _find_evidence(text)
-
-    # --- v3r anti-regression: SCOPE the DECISION-fragmenting dynamic labels OUT
-    # of the QUYẾT ĐỊNH operative zone. COURT_BEHAVIOR / MITIGATING_FACTOR /
-    # AGGRAVATING_FACTOR / CRIMINAL_ACT spans that START at/after the operative
-    # marker fragment DECISION's contiguous gap-fill there; the diagnosis shows
-    # they keep ~98% of their hits in the NHẬN ĐỊNH narrative, so dropping the
-    # operative-zone slice protects DECISION without weakening the factors.
-    # EVIDENCE_ITEM / QUANTITY are KEPT in the operative zone — they are real
-    # exhibits/quantities in "xử lý vật chứng" disposal rulings (legitimate
-    # extraction) and DECISION's gap-fill flows around them.
-    op_start = _operative_zone_start(text)
-    if op_start is not None:
-        spans = [
-            s for s in spans
-            if not (s.label in _OPERATIVE_SUPPRESS and s.start >= op_start)
-        ]
 
     kept = _resolve(spans)
     kept += _decision_gaps(text, kept)

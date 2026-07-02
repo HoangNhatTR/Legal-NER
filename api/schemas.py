@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 from pydantic import BaseModel, Field
+
+# Reuse the Layer-2 / Layer-4 pydantic models as-is (both are pydantic v2
+# BaseModels). Make the package root importable so ``verify.*`` resolves when
+# uvicorn is launched from the legal_ner/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from verify.citation import CitationReport  # noqa: E402,F401
+from verify.existence import ExistenceReport  # noqa: E402,F401
+from verify.forgery import ForgeryReport  # noqa: E402,F401
 
 
 class OdlHealth(BaseModel):
@@ -95,6 +107,10 @@ class ExtractResponse(BaseModel):
         default="pymupdf",
         description="extraction backend used: 'pymupdf' or 'opendataloader'",
     )
+    text: str = Field(
+        default="",
+        description="full normalized text stream (for downstream RAG/validate)",
+    )
 
 
 class ErrorResponse(BaseModel):
@@ -102,7 +118,207 @@ class ErrorResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Async job queue (POST /jobs/extract -> poll GET /jobs/{id})
+# /verify — full happy-path verification chain (L4 forgery + extract + L2)
+# ---------------------------------------------------------------------------
+
+
+class ExtractBlock(BaseModel):
+    """The /extract result embedded inside the /verify response.
+
+    Mirrors ExtractResponse minus ``filename`` (carried at the top level).
+    """
+
+    case_meta: CaseMeta
+    entities: list[Entity]
+    entities_grouped: dict[str, list[Entity]] = Field(
+        description="entities bucketed by type, e.g. {'DEFENDANT': [...]}"
+    )
+    num_pages: int
+    char_count: int = Field(description="length of the flattened text stream")
+    warnings: list[str] = Field(default_factory=list)
+    ocr: OcrInfo | None = None
+    extractor: str = Field(
+        default="pymupdf",
+        description="extraction backend used: 'pymupdf' or 'opendataloader'",
+    )
+    text: str = Field(
+        default="",
+        description="full normalized text stream (for downstream RAG/validate)",
+    )
+
+
+class ExistenceSkipped(BaseModel):
+    """Returned in place of an ExistenceReport when L2 was not run."""
+
+    status: str = Field(description="'skipped'")
+    reason: str = Field(description="why the existence lookup was not performed")
+
+
+class CitationSkipped(BaseModel):
+    """Returned in place of a CitationReport when L1/L3 were not run."""
+
+    status: str = Field(description="'skipped'")
+    reason: str = Field(description="why citation verification was not performed")
+
+
+class OverallVerdict(BaseModel):
+    verdict_vi: str = Field(
+        description="honest, non-alarmist Vietnamese synthesis of all layers"
+    )
+    flags: list[str] = Field(
+        default_factory=list,
+        description="short Vietnamese flags surfacing each signal worth checking",
+    )
+    confidence_note_vi: str = Field(
+        description="reminder that this is decision support, not a legal verdict"
+    )
+
+
+class VerifyResponse(BaseModel):
+    filename: str
+    extract: ExtractBlock
+    forgery: ForgeryReport
+    existence: ExistenceReport | ExistenceSkipped = Field(
+        description="L2 result, or {status:'skipped', reason} when not run"
+    )
+    citation: CitationReport | CitationSkipped = Field(
+        description=(
+            "L1 (cited-law existence) + L3 (sentencing-frame) result over BLHS "
+            "2015 citations, or {status:'skipped', reason} when not run"
+        )
+    )
+    overall: OverallVerdict
+
+
+# ---------------------------------------------------------------------------
+# /analyze — phân tích so sánh qua RAG Module 1 (né validate_document)
+# ---------------------------------------------------------------------------
+
+
+class AnalyzeRequest(BaseModel):
+    """Body cho POST /analyze: dữ liệu đã bóc tách (từ /extract hoặc /verify)."""
+
+    case_meta: CaseMeta | None = None
+    entities_grouped: dict[str, list[Entity]] = Field(
+        default_factory=dict,
+        description="entities bucketed by type (lấy từ /extract hoặc /verify)",
+    )
+    rag_model: str = Field(
+        default="legal-ai-graph",
+        description="RAG mode của Module 1: legal-ai-graph | legal-ai-top15 | legal-ai-full",
+    )
+    llm_model: str = Field(
+        default="",
+        description="Model LLM người dùng chọn ở chế độ trò chuyện (vd cc/claude-sonnet-4-6); "
+        "để trống -> Module 1 dùng LLM mặc định",
+    )
+    text: str = Field(
+        default="",
+        description="toàn văn bản án (cho /analyze/deep — trích diễn biến hành vi)",
+    )
+
+
+class AskTurn(BaseModel):
+    role: str = "user"
+    content: str = ""
+
+
+class AskRequest(BaseModel):
+    """Body cho POST /analyze/ask/stream: hỏi-đáp hybrid trên CHÍNH bản án + kho luật."""
+
+    text: str = Field(default="", description="toàn văn bản án (để chunk + embed)")
+    question: str = Field(description="câu hỏi của người dùng về bản án")
+    history: list[AskTurn] = Field(
+        default_factory=list, description="các lượt hỏi-đáp trước (để nhớ ngữ cảnh)"
+    )
+    # Thực thể đã bóc ở bước /verify — đưa vào ngữ cảnh như một HỒ SƠ VỤ ÁN cố định
+    # để câu hỏi dữ kiện (ai là bị cáo, tội gì, mức án…) trả lời chuẩn dù retrieve trượt.
+    case_meta: CaseMeta | None = None
+    entities_grouped: dict[str, list[Entity]] = Field(
+        default_factory=dict,
+        description="thực thể bucket theo loại (từ /extract hoặc /verify); tuỳ chọn",
+    )
+    rag_model: str = Field(default="legal-ai-graph", description="RAG mode của Module 1")
+    llm_model: str = Field(default="", description="model LLM chọn ở chế độ trò chuyện")
+
+
+class AnalyzeResponse(BaseModel):
+    cited_articles: list[str] = Field(description="số Điều luật đã tra cứu")
+    law_lookup: str = Field(description="nội dung điều luật RAG tra được (markdown)")
+    analysis: str = Field(description="báo cáo đối chiếu/so sánh (markdown)")
+
+
+# ---------------------------------------------------------------------------
+# /precedents — kho tiền lệ + so khớp bản án tương tự
+# ---------------------------------------------------------------------------
+
+
+class PrecedentAddRequest(BaseModel):
+    """Lưu một bản án (đã trích xuất) vào kho tiền lệ cục bộ."""
+
+    case_meta: CaseMeta | None = None
+    entities_grouped: dict[str, list[Entity]] = Field(default_factory=dict)
+    text: str = Field(default="", description="toàn văn bản án (để tóm tắt diễn biến)")
+    source: str = Field(default="confirmed", description="'confirmed' (người dùng) | 'an_le'")
+    title: str = Field(default="", description="nhãn hiển thị (vd 'Án lệ số 30/2020/AL ...')")
+    url: str = Field(default="", description="nguồn (nếu có)")
+
+
+class PrecedentMatchRequest(BaseModel):
+    """Tìm các tiền lệ/bản án tương tự với bản án đang xem."""
+
+    case_meta: CaseMeta | None = None
+    entities_grouped: dict[str, list[Entity]] = Field(default_factory=dict)
+    text: str = Field(default="")
+    top_k: int = Field(default=5, ge=1, le=20)
+    sources: list[str] | None = Field(
+        default=None, description="lọc nguồn: ['an_le'] | ['confirmed'] | None = cả hai"
+    )
+
+
+class PrecedentSearchRequest(BaseModel):
+    """Tìm kiếm tiền lệ TRỰC TIẾP bằng câu/từ khoá tự do (không cần upload bản án)."""
+
+    query: str = Field(description="câu hoặc từ khoá tìm kiếm (vd 'cướp tài sản dùng vũ khí')")
+    top_k: int = Field(default=8, ge=1, le=30)
+    sources: list[str] | None = Field(default=None, description="['an_le'] | ['confirmed'] | None")
+
+
+class PrecedentItem(BaseModel):
+    id: str
+    source: str
+    title: str = ""
+    case_number: str = ""
+    court: str = ""
+    case_type: str = ""
+    crimes: list[str] = Field(default_factory=list)
+    articles: list[str] = Field(default_factory=list)
+    penalties: list[str] = Field(default_factory=list)
+    facts_summary: str = ""
+    url: str = ""
+    score: float = Field(description="độ tương đồng cosine (0–1)")
+    related_by_law: bool = Field(description="có chung điều luật/tội danh hay không")
+
+
+class PrecedentMatchResponse(BaseModel):
+    matches: list[PrecedentItem] = Field(default_factory=list)
+    query_crimes: list[str] = Field(default_factory=list)
+    query_articles: list[str] = Field(default_factory=list)
+
+
+class PrecedentAddResponse(BaseModel):
+    id: str
+    total: int = Field(description="tổng số tiền lệ trong kho sau khi thêm")
+
+
+class PrecedentStatsResponse(BaseModel):
+    total: int
+    an_le: int
+    confirmed: int
+
+
+# ---------------------------------------------------------------------------
+# Async job queue (POST /jobs/extract, /jobs/verify -> poll GET /jobs/{id})
 # ---------------------------------------------------------------------------
 
 

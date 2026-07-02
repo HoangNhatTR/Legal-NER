@@ -1,0 +1,170 @@
+[
+  {
+    "id": "106588",
+    "source": "criminal",
+    "case_type": "ma túy",
+    "flat_len": 1673
+  },
+  {
+    "id": "102375",
+    "source": "criminal",
+    "case_type": "ma túy",
+    "flat_len": 14022
+  },
+  {
+    "id": "104263",
+    "source": "criminal",
+    "case_type": "ma túy",
+    "flat_len": 17847
+  },
+  {
+    "id": "102835",
+    "source": "criminal",
+    "case_type": "ma túy",
+    "flat_len": 70126
+  },
+  {
+    "id": "104476",
+    "source": "criminal",
+    "case_type": "trộm cắp",
+    "flat_len": 1607
+  },
+  {
+    "id": "101464",
+    "source": "criminal",
+    "case_type": "trộm cắp",
+    "flat_len": 15738
+  },
+  {
+    "id": "101260",
+    "source": "criminal",
+    "case_type": "trộm cắp",
+    "flat_len": 77230
+  },
+  {
+    "id": "100203",
+    "source": "criminal",
+    "case_type": "cố ý gây thương tích",
+    "flat_len": 1679
+  },
+  {
+    "id": "101476",
+    "source": "criminal",
+    "case_type": "cố ý gây thương tích",
+    "flat_len": 46391
+  },
+  {
+    "id": "102186",
+    "source": "criminal",
+    "case_type": "giao thông",
+    "flat_len": 9069
+  },
+  {
+    "id": "104821",
+    "source": "criminal",
+    "case_type": "giao thông",
+    "flat_len": 68330
+  },
+  {
+    "id": "102641",
+    "source": "criminal",
+    "case_type": "đánh bạc",
+    "flat_len": 1638
+  },
+  {
+    "id": "100640",
+    "source": "criminal",
+    "case_type": "đánh bạc",
+    "flat_len": 86679
+  },
+  {
+    "id": "104295",
+    "source": "criminal",
+    "case_type": "cướp",
+    "flat_len": 1430
+  },
+  {
+    "id": "101809",
+    "source": "criminal",
+    "case_type": "cướp",
+    "flat_len": 35779
+  },
+  {
+    "id": "100201",
+    "source": "criminal",
+    "case_type": "lừa đảo",
+    "flat_len": 1636
+  },
+  {
+    "id": "103640",
+    "source": "criminal",
+    "case_type": "lừa đảo",
+    "flat_len": 126724
+  },
+  {
+    "id": "104071",
+    "source": "criminal",
+    "case_type": "ma túy",
+    "flat_len": 32027
+  },
+  {
+    "id": "civil_100585",
+    "source": "civil",
+    "case_type": "ly hôn"
+  },
+  {
+    "id": "civil_100618",
+    "source": "civil",
+    "case_type": "ly hôn"
+  },
+  {
+    "id": "civil_100645",
+    "source": "civil",
+    "case_type": "ly hôn"
+  },
+  {
+    "id": "civil_100883",
+    "source": "civil",
+    "case_type": "ly hôn"
+  },
+  {
+    "id": "civil_100556",
+    "source": "civil",
+    "case_type": "ly hôn"
+  },
+  {
+    "id": "civil_100221",
+    "source": "civil",
+    "case_type": "tranh chấp"
+  },
+  {
+    "id": "civil_100070",
+    "source": "civil",
+    "case_type": "tranh chấp"
+  },
+  {
+    "id": "civil_100043",
+    "source": "civil",
+    "case_type": "tranh chấp"
+  },
+  {
+    "id": "civil_101005",
+    "source": "civil",
+    "case_type": "hợp đồng"
+  },
+  {
+    "id": "civil_100062",
+    "source": "civil",
+    "case_type": "hợp đồng"
+  },
+  {
+    "id": "civil_100052",
+    "source": "civil",
+    "case_type": "hành chính"
+  },
+  {
+    "id": "civil_100586",
+    "source": "civil",
+    "case_type": "thừa kế"
+  }
+]
