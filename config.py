@@ -152,6 +152,16 @@ CHUNK_TOKENS = 150
 # entity that straddles a window edge intact for "first-decided-wins" merge.
 INFER_WINDOW = 200          # syllable tokens per window
 INFER_STRIDE = 150          # advance per window (50-token overlap)
+# Subword budget for ONE forward pass. xlm-roberta supports 512 positions; a
+# window is at most INFER_WINDOW + (INFER_WINDOW - INFER_STRIDE) = 250 syllables
+# (the sentence-extension hard cap), which is ~320 subwords on dense judgment
+# prose (money/dates/case-numbers/foreign names tokenize >1 subword each). The
+# old 256 cap silently TRUNCATED such windows: the tail syllables produced no
+# word_ids and were left "O" — a real recall hole at section/sentence cuts.
+# 512 covers the 250-syllable hard cap for any realistic subword ratio (<2.0)
+# so no in-window syllable is ever dropped. Sequences shorter than this are
+# unaffected (padding/truncation only ever applied at the cap).
+INFER_MAX_SUBWORDS = 512
 # Section-aware inference (default): windows never cross a major-section
 # boundary (PREAMBLE / NHÂN DANH / NỘI DUNG / NHẬN ĐỊNH / QUYẾT ĐỊNH), and a
 # section longer than INFER_WINDOW is sub-chunked at SENTENCE boundaries near

@@ -25,7 +25,7 @@ from corpus.normalize import flatten_for_matching, normalize_text  # noqa: E402
 from labeling.patterns import Span, derive_doc_meta  # noqa: E402
 from training.infer import infer_entities, load_model  # noqa: E402
 
-from api.ocr_adapter import OcrError, OcrResult, run_ocr_on_pdf  # noqa: E402
+from api.ocr_adapter import OcrError, OcrResult, _venv_ok, run_ocr_on_pdf  # noqa: E402
 from api.odl_adapter import OdlError, extract_with_odl  # noqa: E402
 
 # Production NER checkpoint shipped with this bundle: xlm-roberta-base
@@ -120,11 +120,13 @@ def looks_like_pdf(data: bytes, content_type: str | None) -> bool:
     return bool(content_type and "pdf" in content_type.lower())
 
 
-def _infer_and_group(text: str, holder: ModelHolder) -> tuple[dict, list[dict], dict, list[str]]:
+def _infer_and_group(
+    text: str, holder: ModelHolder
+) -> tuple[dict, list[dict], dict, list[str], str]:
     """Shared normalize -> infer -> group -> derive_meta flow.
 
     ``text`` is the already-extracted raw text (native layer OR OCR). Returns
-    (case_meta, entities, entities_grouped, warnings).
+    (case_meta, entities, entities_grouped, warnings, normalized_text).
     """
     warnings: list[str] = []
 
@@ -146,7 +148,8 @@ def _infer_and_group(text: str, holder: ModelHolder) -> tuple[dict, list[dict], 
         warnings.append("no CASE_NUMBER entity detected; case_meta is empty")
 
     entities = [
-        {"type": e["label"], "text": e["text"], "start": e["start"], "end": e["end"]}
+        {"type": e["label"], "text": e["text"], "start": e["start"],
+         "end": e["end"], "score": e.get("score")}
         for e in raw_entities
     ]
     grouped: dict[str, list[dict]] = {}
@@ -175,6 +178,19 @@ def _extract_pymupdf(
         if not allow_ocr:
             raise ScannedPdfError(
                 "scanned PDF: text-layer extraction failed and allow_ocr=false"
+            )
+        # This is an NER-only inference bundle: no OCR engine ships with it.
+        # The Phase-1 OCR pipeline (api/ocr_adapter.py) is an OPTIONAL hook that
+        # expects a separate OCR venv; when it isn't wired up, give the caller
+        # the documented, actionable message instead of leaking an absolute path
+        # to a venv that only existed on the author's machine.
+        ocr_ready, _ = _venv_ok()
+        if not ocr_ready:
+            raise ScannedPdfError(
+                "scanned PDF (no text layer): OCR is not bundled in this "
+                "inference package. Supply a text-layer PDF, use "
+                "?extractor=opendataloader with a hybrid OCR server, or wire up "
+                "your own OCR (see api/ocr_adapter.py)."
             )
         try:
             ocr = run_ocr_on_pdf(data)

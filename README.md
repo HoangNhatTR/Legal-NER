@@ -8,8 +8,9 @@ text of a judgment PDF.
 - **Model**: `xlm-roberta-base` fine-tuned on Vietnamese judgments, 31-label
   BIO scheme (63 tags). Self-eval micro-F1 ≈ **0.97**.
 - **Input**: a judgment **PDF with a text layer** (or a plain-text file).
-- **Output**: a list of entities, each `{type, text, start, end}` (char offsets
-  into the normalized text), plus document-level `case_meta`
+- **Output**: a list of entities, each `{type, text, start, end, score}` (char
+  offsets into the normalized text; `score` = mean per-token softmax confidence
+  of the span, handy for thresholding), plus document-level `case_meta`
   (`case_number`, `case_type`, `procedure_stage`).
 - **Interfaces**: a CLI (`python -m training.infer …`) and a small HTTP API
   (`/extract`, `/health`, async `/jobs/extract`).
@@ -105,7 +106,7 @@ curl -F 'file=@judgment.pdf' 'http://localhost:8100/extract'
 {
   "filename": "judgment.pdf",
   "case_meta": { "case_number": "17/2018/HS-ST", "case_type": "hình sự", "procedure_stage": "sơ thẩm" },
-  "entities": [ { "type": "DEFENDANT", "text": "Nguyễn Vĩnh H", "start": 891, "end": 904 } ],
+  "entities": [ { "type": "DEFENDANT", "text": "Nguyễn Vĩnh H", "start": 891, "end": 904, "score": 0.99 } ],
   "entities_grouped": { "DEFENDANT": [ ... ], "ARTICLE": [ ... ] },
   "num_pages": 5,
   "char_count": 12345,

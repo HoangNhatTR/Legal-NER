@@ -16,16 +16,19 @@ from transformers import AutoModelForTokenClassification, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import (  # noqa: E402
+    INFER_MAX_SUBWORDS,
     INFER_SECTION_AWARE,
     INFER_STRIDE,
     INFER_WINDOW,
-    MAX_SEQ_LENGTH,
     MODELS_DIR,
 )
-from corpus.extract import extract_pdf_text  # noqa: E402
 from corpus.normalize import flatten_for_matching, normalize_text  # noqa: E402
 from corpus.sectioner import segment_sections  # noqa: E402
 from labeling.weak_label import tokenize_with_offsets  # noqa: E402
+
+# NOTE: corpus.extract (PyMuPDF/fitz) is imported LAZILY inside main(): the
+# inference engine (infer_entities / predict_tags / tags_to_entities) runs on
+# already-extracted text and must not force a PDF library on library consumers.
 
 # Back-compat aliases (some callers / tests import WINDOW/STRIDE by name).
 WINDOW = INFER_WINDOW
@@ -40,12 +43,47 @@ _SENT_BREAK_TOKENS = frozenset({".", ";", ":", "!", "?"})
 
 
 def _run_window(model, tokenizer, words: list[str], device):
-    """One forward pass over ``words``; return (pred_ids, word_ids)."""
+    """One forward pass over ``words``; return (pred_ids, confs, word_ids).
+
+    ``confs`` is the per-subword max softmax probability (confidence of the
+    argmax tag), parallel to ``pred_ids``. A coverage check warns (once) if the
+    subword budget truncated the window — with INFER_MAX_SUBWORDS=512 and the
+    250-syllable hard cap this should never fire, but it guards against a future
+    window/budget mismatch silently dropping the window's tail.
+    """
     enc = tokenizer(words, is_split_into_words=True, truncation=True,
-                    max_length=MAX_SEQ_LENGTH, return_tensors="pt").to(device)
+                    max_length=INFER_MAX_SUBWORDS, return_tensors="pt").to(device)
     with torch.no_grad():
         logits = model(**enc).logits[0]
-    return logits.argmax(dim=-1).tolist(), enc.word_ids(0)
+    probs = torch.softmax(logits, dim=-1)
+    confs, pred_ids = probs.max(dim=-1)
+    word_ids = enc.word_ids(0)
+    _warn_if_truncated(word_ids, len(words))
+    return pred_ids.tolist(), confs.tolist(), word_ids
+
+
+_TRUNCATION_WARNED = False
+
+
+def _warn_if_truncated(word_ids: list, n_words: int) -> None:
+    """Emit a one-shot stderr warning if the window's last syllable was dropped.
+
+    A truncated window leaves its tail syllables with no word_id, so they stay
+    "O" — a silent recall hole. We only warn once to avoid log spam.
+    """
+    global _TRUNCATION_WARNED
+    if _TRUNCATION_WARNED or n_words == 0:
+        return
+    covered = [w for w in word_ids if w is not None]
+    if covered and max(covered) < n_words - 1:
+        _TRUNCATION_WARNED = True
+        print(
+            f"[infer] WARNING: a {n_words}-syllable window exceeded the "
+            f"{INFER_MAX_SUBWORDS}-subword budget and was truncated at syllable "
+            f"{max(covered) + 1}; tail syllables are unlabeled. Lower INFER_WINDOW "
+            f"or raise INFER_MAX_SUBWORDS in config.py.",
+            file=sys.stderr, flush=True,
+        )
 
 
 def _sentence_chunks(syllables: list[str], lo: int, hi: int) -> list[tuple[int, int]]:
@@ -82,16 +120,18 @@ def _sentence_chunks(syllables: list[str], lo: int, hi: int) -> list[tuple[int, 
 
 
 def _predict_range(model, tokenizer, syllables: list[str], lo: int, hi: int,
-                   tags: list[str], decided: list[bool], device) -> int:
+                   tags: list[str], decided: list[bool], scores: list[float],
+                   device) -> int:
     """Predict tags for ``syllables[lo:hi]`` as an independent sequence.
 
     Windows are confined to ``[lo, hi)`` (never cross a section boundary) and
-    cut at sentence boundaries. Writes into ``tags``/``decided`` in place with
-    "first-decided-wins" at overlaps. Returns the number of forward passes.
+    cut at sentence boundaries. Writes into ``tags``/``scores``/``decided`` in
+    place with "first-decided-wins" at overlaps. Returns the number of forward
+    passes.
     """
     passes = 0
     for cs, ce in _sentence_chunks(syllables, lo, hi):
-        pred_ids, word_ids = _run_window(model, tokenizer, syllables[cs:ce], device)
+        pred_ids, confs, word_ids = _run_window(model, tokenizer, syllables[cs:ce], device)
         passes += 1
         seen = set()
         for pos, wid in enumerate(word_ids):
@@ -101,13 +141,15 @@ def _predict_range(model, tokenizer, syllables: list[str], lo: int, hi: int,
             gi = cs + wid
             if not decided[gi]:
                 tags[gi] = model.config.id2label[pred_ids[pos]]
+                scores[gi] = confs[pos]
                 decided[gi] = True
     return passes
 
 
 def predict_tags(model, tokenizer, syllables: list[str], device,
                  *, section_aware: bool = INFER_SECTION_AWARE,
-                 sections: list[tuple[int, int]] | None = None) -> list[str]:
+                 sections: list[tuple[int, int]] | None = None,
+                 scores_out: list[float] | None = None) -> list[str]:
     """Predict a BIO tag for every syllable.
 
     section_aware (default): each major judgment section is decoded as an
@@ -120,15 +162,21 @@ def predict_tags(model, tokenizer, syllables: list[str], device,
 
     section_aware=False: legacy blind sliding window (WINDOW / STRIDE), kept
     for before/after comparison.
+
+    ``scores_out`` (optional): when provided, it is resized to one entry per
+    syllable and filled with the model's per-syllable confidence (max softmax
+    prob of the chosen tag) using the same first-decided-wins rule as the tags.
+    Returning tags-only keeps the signature back-compatible for older callers.
     """
     tags = ["O"] * len(syllables)
+    scores = [0.0] * len(syllables)
 
     if not section_aware:
         decided = [False] * len(syllables)
         start = 0
         while start < len(syllables):
             window = syllables[start: start + INFER_WINDOW]
-            pred_ids, word_ids = _run_window(model, tokenizer, window, device)
+            pred_ids, confs, word_ids = _run_window(model, tokenizer, window, device)
             seen = set()
             for pos, wid in enumerate(word_ids):
                 if wid is None or wid in seen:
@@ -137,46 +185,68 @@ def predict_tags(model, tokenizer, syllables: list[str], device,
                 gi = start + wid
                 if not decided[gi]:
                     tags[gi] = model.config.id2label[pred_ids[pos]]
+                    scores[gi] = confs[pos]
                     decided[gi] = True
             if start + INFER_WINDOW >= len(syllables):
                 break
             start += INFER_STRIDE
-        return tags
+    else:
+        decided = [False] * len(syllables)
+        if not sections:
+            sections = [(0, len(syllables))]
+        for lo, hi in sections:
+            _predict_range(model, tokenizer, syllables, lo, hi, tags, decided,
+                           scores, device)
 
-    decided = [False] * len(syllables)
-    if not sections:
-        sections = [(0, len(syllables))]
-    for lo, hi in sections:
-        _predict_range(model, tokenizer, syllables, lo, hi, tags, decided, device)
+    if scores_out is not None:
+        scores_out[:] = scores
     return tags
 
 
 def tags_to_entities(tokens: list[tuple[str, int, int]], tags: list[str],
-                     text: str) -> list[dict]:
+                     text: str, scores: list[float] | None = None) -> list[dict]:
+    """Decode BIO tags into entity dicts.
+
+    Robust decoding: a B- tag always opens a new span; an I-X tag CONTINUES the
+    current span only when X matches the open label, otherwise it OPENS a new X
+    span. This recovers two common token-classifier outputs the strict "B- only
+    opens" decoder silently dropped: a leading I-X with no preceding B-X, and a
+    label switch B-Y…I-X. Well-formed B/I sequences decode identically to before.
+
+    When ``scores`` (per-syllable confidence, parallel to ``tags``) is given,
+    each entity gets a ``score`` = mean confidence over its syllables, rounded.
+    """
     entities = []
-    current = None  # (label, start_tok, end_tok)
+    current = None  # [label, start_tok, end_tok]
     for i, tag in enumerate(tags):
-        if tag.startswith("B-"):
+        if tag == "O" or len(tag) < 3:
             if current:
                 entities.append(current)
-            current = [tag[2:], i, i]
-        elif tag.startswith("I-") and current and tag[2:] == current[0]:
+            current = None
+            continue
+        kind, label = tag[0], tag[2:]
+        if current and kind == "I" and label == current[0]:
             current[2] = i
         else:
             if current:
                 entities.append(current)
-            current = None
+            current = [label, i, i]
     if current:
         entities.append(current)
-    return [
-        {
+
+    out = []
+    for label, s, e in entities:
+        ent = {
             "label": label,
             "start": tokens[s][1],
             "end": tokens[e][2],
             "text": text[tokens[s][1]: tokens[e][2]],
         }
-        for label, s, e in entities
-    ]
+        if scores is not None:
+            span = scores[s: e + 1]
+            ent["score"] = round(sum(span) / len(span), 4) if span else None
+        out.append(ent)
+    return out
 
 
 def load_model(model_path: str, device: str):
@@ -221,7 +291,8 @@ def infer_entities(text: str, model, tokenizer, device,
 
     ``text`` must be the flattened-for-matching stream so that the returned
     ``start``/``end`` offsets index into it. Each entity:
-    ``{"label", "start", "end", "text"}``.
+    ``{"label", "start", "end", "text", "score"}`` (``score`` = mean per-syllable
+    confidence of the span).
 
     When ``section_aware`` (default, from ``config.INFER_SECTION_AWARE``), the
     document is split into major judgment sections and each is decoded as an
@@ -235,9 +306,11 @@ def infer_entities(text: str, model, tokenizer, device,
     tokens = tokenize_with_offsets(text)
     syllables = [t for t, _, _ in tokens]
     sections = _section_token_ranges(tokens, text) if section_aware else None
+    scores: list[float] = []
     tags = predict_tags(model, tokenizer, syllables, device,
-                        section_aware=section_aware, sections=sections)
-    return tags_to_entities(tokens, tags, text)
+                        section_aware=section_aware, sections=sections,
+                        scores_out=scores)
+    return tags_to_entities(tokens, tags, text, scores)
 
 
 def main() -> None:
@@ -251,6 +324,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.pdf:
+        from corpus.extract import extract_pdf_text  # lazy: PyMuPDF only for --pdf
         raw = extract_pdf_text(Path(args.pdf))
         if raw is None:
             sys.exit("ERROR: PDF has no text layer (scan?) — not supported.")
