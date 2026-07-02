@@ -64,6 +64,22 @@ def test_khop_ban_goc_va_van_ban_hop_nhat():
     assert not _law_matches_title("Bộ luật Dân sự", "Bộ luật Hình sự")
 
 
+def test_khong_nham_luat_voi_luat_to_tung():
+    """Token 'bộ luật hình sự' là tập con của 'bộ luật tố tụng hình sự' —
+    discriminator 'tố tụng' phải chặn cả 2 chiều (bug thật từ e2e đợt 3)."""
+    assert not _law_matches_title(
+        "Bộ luật Hình sự năm 1999",
+        "Văn bản hợp nhất 104/VBHN-VPQH năm 2025 hợp nhất Bộ luật Tố tụng hình sự",
+    )
+    assert not _law_matches_title(
+        "Bộ luật Tố tụng Hình sự", "Bộ luật Hình sự",
+    )
+    assert _law_matches_title(
+        "Bộ luật Tố tụng Hình sự năm 2015",
+        "Văn bản hợp nhất 46/VBHN-VPQH hợp nhất Bộ Luật Tố tụng hình sự",
+    )
+
+
 # ── corpus_check với stub HTTP ─────────────────────────────────────────────────
 
 class _Resp:
@@ -106,6 +122,47 @@ def test_corpus_check_module1_tat_thi_skipped(monkeypatch):
 
     assert report["status"] == "skipped"
     assert "Module 1" in report["note"]
+    assert all(r["status"] == "error" for r in report["results"])
+
+
+def test_loi_ben_vung_mot_vien_dan_khong_huy_ca_loat(monkeypatch):
+    """Timeout LẶP LẠI (cả retry) ở 1 viện dẫn → item đó 'error', viện dẫn khác vẫn kiểm."""
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        if "Điều 250" in json["query"]:
+            raise cc.requests.ReadTimeout("quá 120s")  # lỗi cả 2 lần (retry vẫn fail)
+        return _Resp([{
+            "article": f"Điều {json['query'].split()[-1]}",
+            "title": "Bộ luật Dân sự", "doc_number": "91/2015/QH13",
+        }])
+
+    monkeypatch.setattr(cc.requests, "post", _fake_post)
+    report = corpus_check(GROUPED)
+
+    assert report["status"] == "ok"
+    by_art = {r["article"]: r["status"] for r in report["results"]}
+    assert by_art[250] == "error"
+    assert by_art[468] in ("found", "not_found")
+
+
+def test_timeout_thoang_qua_duoc_retry_cuu(monkeypatch):
+    """Lỗi 1 lần đầu → retry lần 2 thành công → item vẫn được kiểm bình thường."""
+    calls = {"n": 0}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise cc.requests.ReadTimeout("lượt đầu chậm")
+        return _Resp([{
+            "article": f"Điều {json['query'].split()[-1]}",
+            "title": "Bộ luật Hình sự", "doc_number": "100/2015/QH13",
+        }])
+
+    monkeypatch.setattr(cc.requests, "post", _fake_post)
+    report = corpus_check(GROUPED)
+
+    assert report["status"] == "ok"
+    assert all(r["status"] != "error" for r in report["results"])
 
 
 def test_corpus_check_khong_vien_dan():

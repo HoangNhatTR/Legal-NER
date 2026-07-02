@@ -76,27 +76,55 @@ def extract_citation_pairs(grouped: dict, limit: int = 8) -> list[dict]:
     return pairs[:limit]
 
 
+# Cụm phân biệt cặp luật dễ nhầm: token 'bộ luật hình sự' là TẬP CON của
+# 'bộ luật tố tụng hình sự' → phải cùng CÓ hoặc cùng KHÔNG có cụm này.
+_DISCRIMINATORS = ("tố tụng",)
+
+
 def _law_matches_title(law: str, title: str) -> bool:
     """Tên luật khớp title chunk: mọi token có nghĩa của tên luật nằm trong title.
 
-    'Bộ luật Hình sự' khớp cả bản gốc lẫn 'Văn bản hợp nhất ... Bộ luật Hình sự'.
+    'Bộ luật Hình sự' khớp cả bản gốc lẫn 'Văn bản hợp nhất ... Bộ luật Hình sự',
+    nhưng KHÔNG khớp 'Bộ luật Tố tụng hình sự' (discriminator 'tố tụng').
     """
     t = (title or "").lower()
-    tokens = [w for w in _norm_law(law).split() if w not in _STOP_TOKENS]
-    return bool(tokens) and all(w in t for w in tokens)
+    norm = _norm_law(law)
+    tokens = [w for w in norm.split() if w not in _STOP_TOKENS]
+    if not tokens or not all(w in t for w in tokens):
+        return False
+    for d in _DISCRIMINATORS:
+        if (d in t) != (d in norm):
+            return False
+    return True
 
 
 def _check_one(pair: dict, timeout: float) -> dict:
-    """Kiểm 1 cặp qua /v1/retrieve. Trả {article, law, status, matched_title?}."""
+    """Kiểm 1 cặp qua /v1/retrieve. Trả {article, law, status, matched_title?}.
+
+    rerank=False: kiểm TỒN TẠI không cần thứ hạng đẹp — RRF thô nhanh gấp
+    5-10 lần CrossEncoder và cho phép top_k lớn (nhiều ứng viên = recall cao).
+    Query dùng tên luật ĐÃ CHUẨN HÓA (bỏ đuôi 'năm... (sửa đổi, bổ sung...)')
+    để khỏi nhiễu. Timeout ở 1 lượt → retry đúng 1 lần rồi mới bỏ.
+    """
     art, law = pair["article"], pair["law"]
-    query = f"{law} Điều {art}"
-    r = requests.post(
-        f"{RAG_URL}/v1/retrieve",
-        headers={"Authorization": f"Bearer {RAG_KEY}"},
-        json={"query": query, "top_k": 8, "model": "legal-ai-full"},
-        timeout=timeout,
-    )
-    r.raise_for_status()
+    query = f"{_norm_law(law)} Điều {art}"
+    body = {"query": query, "top_k": 12, "model": "legal-ai-full", "rerank": False}
+    last_exc: Exception | None = None
+    for _attempt in range(2):
+        try:
+            r = requests.post(
+                f"{RAG_URL}/v1/retrieve",
+                headers={"Authorization": f"Bearer {RAG_KEY}"},
+                json=body,
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+    else:
+        raise last_exc  # type: ignore[misc]
+
     for c in r.json().get("chunks", []):
         if (c.get("article") or "") == f"Điều {art}" and _law_matches_title(
             law, c.get("title") or ""
@@ -109,13 +137,15 @@ def _check_one(pair: dict, timeout: float) -> dict:
     return {"article": art, "law": law, "status": "not_found"}
 
 
-def corpus_check(grouped: dict, timeout: float = 15.0) -> dict:
+def corpus_check(grouped: dict, timeout: float = 120.0) -> dict:
     """Kiểm chứng mọi viện dẫn của bản án trên kho luật Module 1.
 
     Trả về:
       {status: ok|skipped, checked, found, not_found, results: [...], note}
     'not_found' nghĩa là KHÔNG tìm thấy đúng Điều trong đúng văn bản — có thể
     do viện dẫn sai, NER bóc thiếu, hoặc corpus chưa có văn bản đó (xem note).
+    Lỗi mạng/timeout ở MỘT viện dẫn → item đó status='error', các viện dẫn
+    khác vẫn kiểm tiếp; tất cả lỗi → status='skipped'.
     """
     pairs = extract_citation_pairs(grouped)
     if not pairs:
@@ -125,22 +155,31 @@ def corpus_check(grouped: dict, timeout: float = 15.0) -> dict:
         }
 
     results: list[dict] = []
-    try:
-        for p in pairs:
+    errors = 0
+    for p in pairs:
+        try:
             results.append(_check_one(p, timeout))
-    except requests.RequestException as exc:
+        except requests.RequestException as exc:
+            errors += 1
+            results.append({
+                "article": p["article"], "law": p["law"], "status": "error",
+                "note": str(exc)[:120],
+            })
+
+    if errors == len(pairs):
         return {
             "status": "skipped", "checked": 0, "found": 0, "not_found": 0,
             "results": results,
-            "note": f"Không gọi được kho luật Module 1 ({RAG_URL}): {exc}",
+            "note": f"Không gọi được kho luật Module 1 ({RAG_URL}).",
         }
 
     found = sum(1 for x in results if x["status"] == "found")
+    not_found = sum(1 for x in results if x["status"] == "not_found")
     return {
         "status": "ok",
-        "checked": len(results),
+        "checked": len(results) - errors,
         "found": found,
-        "not_found": len(results) - found,
+        "not_found": not_found,
         "results": results,
         "note": (
             "Đối chiếu trên kho luật lớn (mọi ngành luật) — 'not_found' cần "
